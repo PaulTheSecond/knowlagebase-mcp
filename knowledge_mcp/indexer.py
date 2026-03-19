@@ -8,6 +8,7 @@ from typing import Generator
 import pathspec
 
 from .db import KnowledgeDB
+from .embeddings import OllamaEmbedder
 
 logger = logging.getLogger(__name__)
 
@@ -20,8 +21,10 @@ def hash_file(filepath: Path, chunk_size: int = 8192) -> str:
     return hasher.hexdigest()
 
 class Indexer:
-    def __init__(self, db: KnowledgeDB):
+    def __init__(self, db: KnowledgeDB, use_embeddings: bool = True):
         self.db = db
+        self.use_embeddings = use_embeddings
+        self.embedder = OllamaEmbedder() if use_embeddings else None
 
     def _get_ignore_spec(self, root_path: Path) -> pathspec.PathSpec:
         """Считывает .gitignore и добавляет системные исключения."""
@@ -132,7 +135,7 @@ class Indexer:
             source_kind = 'docs' if rel_path.startswith(('docs/', 'knowledge/')) or rel_path.endswith('.md') else 'code'
             trust = 'hint' if source_kind == 'docs' else 'verified'
             
-            self.db.add_chunk(
+            chunk_rowid = self.db.add_chunk(
                 chunk_id=chunk_id,
                 file_id=file_id,
                 content=content,
@@ -141,6 +144,11 @@ class Indexer:
                 line_start=1,
                 line_end=lines_count
             )
-        except Exception:
-            # Игнорируем бинарные файлы (UnicodeDecodeError и пр.)
-            pass
+            
+            if self.use_embeddings and self.embedder:
+                vector = self.embedder.embed_text(content)
+                if vector:
+                    self.db.add_embedding(chunk_rowid, vector)
+        except Exception as e:
+            # Скипаем в случае проблем кодировок (бинарники)
+            logger.warning(f"Failed parsing file {rel_path}: {e}")
