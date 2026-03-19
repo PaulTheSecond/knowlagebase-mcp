@@ -8,7 +8,8 @@ from pydantic import BaseModel
 from .db import KnowledgeDB
 from .indexer import Indexer
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# ВАЖНО: Весь логгер должен идти в sys.stderr, иначе MCP (общающийся по stdout) сломается!
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", stream=sys.stderr)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Knowledge Base Sync Trigger")
@@ -52,6 +53,10 @@ def main():
     serve_parser = subparsers.add_parser("serve", help="Start HTTP server to listen for /sync webhook triggers")
     serve_parser.add_argument("--host", type=str, default="127.0.0.1", help="Host interface")
     serve_parser.add_argument("--port", type=int, default=8000, help="Port to listen on")
+    
+    # Режим MCP-сервера (Codex, Claude, Gemini)
+    mcp_parser = subparsers.add_parser("mcp", help="Start the MCP stdio server")
+    mcp_parser.add_argument("--no-embeddings", action="store_true", help="Disable heavy vector search")
 
     args = parser.parse_args()
 
@@ -67,6 +72,11 @@ def main():
     elif args.command == "serve":
         logger.info(f"Starting trigger HTTP endpoint on {args.host}:{args.port}")
         uvicorn.run(app, host=args.host, port=args.port)
+    elif args.command == "mcp":
+        # Запускаем асинхронный сервер MCP
+        import asyncio
+        from .server import start_mcp_server
+        asyncio.run(start_mcp_server(args.db_path, enable_embeddings=not args.no_embeddings))
 
 if __name__ == "__main__":
     main()

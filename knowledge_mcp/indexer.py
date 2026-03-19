@@ -8,7 +8,7 @@ from typing import Generator
 import pathspec
 
 from .db import KnowledgeDB
-from .embeddings import OllamaEmbedder
+from .embeddings import LocalEmbedder
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +24,7 @@ class Indexer:
     def __init__(self, db: KnowledgeDB, use_embeddings: bool = True):
         self.db = db
         self.use_embeddings = use_embeddings
-        self.embedder = OllamaEmbedder() if use_embeddings else None
+        self.embedder = LocalEmbedder() if use_embeddings else None
 
     def _get_ignore_spec(self, root_path: Path) -> pathspec.PathSpec:
         """Считывает .gitignore и добавляет системные исключения."""

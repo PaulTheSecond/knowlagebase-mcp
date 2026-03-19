@@ -68,22 +68,21 @@ class KnowledgeDB:
                 "id": "20260319_02_fts_and_vec",
                 "up": f"""
                     CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-                        content,
-                        content_rowid=id
+                        content
                     );
                     CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
                         embedding float[{self.vec_dim}]
                     );
 
                     CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
-                        INSERT INTO chunks_fts(content_rowid, content) VALUES (new.id, new.content);
+                        INSERT INTO chunks_fts(rowid, content) VALUES (new.rowid, new.content);
                     END;
                     CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
-                        INSERT INTO chunks_fts(chunks_fts, content_rowid, content) VALUES('delete', old.id, old.content);
+                        INSERT INTO chunks_fts(chunks_fts, rowid, content) VALUES('delete', old.rowid, old.content);
                     END;
                     CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN
-                        INSERT INTO chunks_fts(chunks_fts, content_rowid, content) VALUES('delete', old.id, old.content);
-                        INSERT INTO chunks_fts(content_rowid, content) VALUES (new.id, new.content);
+                        INSERT INTO chunks_fts(chunks_fts, rowid, content) VALUES('delete', old.rowid, old.content);
+                        INSERT INTO chunks_fts(rowid, content) VALUES (new.rowid, new.content);
                     END;
                 """
             }
@@ -160,9 +159,10 @@ class KnowledgeDB:
         cursor = self.conn.cursor()
         
         sql = '''
-            SELECT c.*, f.repo_id, f.path, bm25(chunks_fts) as rank
+            SELECT c.id, c.content, c.source_kind, c.trust, c.line_start, c.line_end, 
+                   f.repo_id, f.path, bm25(chunks_fts) as rank
             FROM chunks_fts fts
-            JOIN chunks c ON fts.content_rowid = c.id
+            JOIN chunks c ON fts.rowid = c.rowid
             JOIN files f ON c.file_id = f.id
             WHERE chunks_fts MATCH ?
         '''

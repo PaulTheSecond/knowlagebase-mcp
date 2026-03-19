@@ -4,4 +4,4 @@ pathspec
 fastapi
 uvicorn
 sqlite-vec
-httpx
+sentence-transformers

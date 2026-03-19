@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  knowledge-mcp:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      # Volume для сохранения SQLite БД между перезапусками контейнера
+      - ./data:/data
+      # Папка с исходниками (монтируется как read-only). По умолчанию это локальная папка ./src
+      # Если ваши проекты лежат в другом месте, просто создайте .env файл и укажите: REPOS_DIR=/path/to/my/projects
+      - ${REPOS_DIR:-./src}:/repos:ro
+      # Проброс кэша HuggingFace, чтобы не скачивать модель (весом ~400мб) при каждом рестарте контейнера
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    environment:
+      - DB_PATH=/data/knowledge.db
+    
+    # Команда по умолчанию: поднимает HTTP сервер триггеров
+    command: python -m knowledge_mcp.main --db-path /data/knowledge.db serve --host 0.0.0.0 --port 8000
