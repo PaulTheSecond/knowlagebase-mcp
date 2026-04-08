@@ -21,6 +21,7 @@ class KnowledgeDB:
         self.conn.enable_load_extension(False)
         
         self.vec_dim = 768  # Утвержден для Ollama nomic-embed-text
+        self._in_transaction = False  # Флаг: внутри явной транзакции (skip individual commits)
         self._apply_migrations()
 
     def _apply_migrations(self):
@@ -119,6 +120,26 @@ class KnowledgeDB:
         """Закрывает соединение с БД."""
         self.conn.close()
 
+    def begin_transaction(self):
+        """Начинает явную транзакцию для пакетных операций (избегаем тысяч отдельных commit)."""
+        self.conn.execute("BEGIN")
+        self._in_transaction = True
+
+    def commit_transaction(self):
+        """Фиксирует текущую транзакцию."""
+        self.conn.commit()
+        self._in_transaction = False
+
+    def rollback_transaction(self):
+        """Откатывает текущую транзакцию при ошибке."""
+        self.conn.rollback()
+        self._in_transaction = False
+
+    def _auto_commit(self):
+        """Вызывает commit() только если мы НЕ внутри явной транзакции."""
+        if not self._in_transaction:
+            self.conn.commit()
+
     def get_known_files(self, repo_id: str) -> Dict[str, sqlite3.Row]:
         """Возвращает словарь известных файлов репозитория: path -> Row(id, mtime, hash)."""
         cursor = self.conn.cursor()
@@ -135,7 +156,7 @@ class KnowledgeDB:
                 mtime=excluded.mtime,
                 hash=excluded.hash
         """, (repo_id, path, mtime, file_hash))
-        self.conn.commit()
+        self._auto_commit()
         
         cursor.execute("SELECT id FROM files WHERE repo_id = ? AND path = ?", (repo_id, path))
         return cursor.fetchone()['id']
@@ -144,21 +165,21 @@ class KnowledgeDB:
         """Удаляет файл и каскадно (благодаря FOREIGN KEY) удаляет все его чанки."""
         cursor = self.conn.cursor()
         cursor.execute("DELETE FROM files WHERE id = ?", (file_id,))
-        self.conn.commit()
+        self._auto_commit()
 
     def delete_repo(self, repo_id: str) -> int:
         """Удаляет все файлы и чанки (каскадно), связанные с репозиторием."""
         cursor = self.conn.cursor()
         cursor.execute("DELETE FROM files WHERE repo_id = ?", (repo_id,))
         deleted_count = cursor.rowcount
-        self.conn.commit()
+        self._auto_commit()
         return deleted_count
 
     def clear_file_chunks(self, file_id: int):
         """Удаляет все чанки, привязанные к заданному файлу (перед реиндексацией 'грязного' файла)."""
         cursor = self.conn.cursor()
         cursor.execute("DELETE FROM chunks WHERE file_id = ?", (file_id,))
-        self.conn.commit()
+        self._auto_commit()
 
     def add_chunk(self, chunk_id: str, file_id: int, content: str, 
                   source_kind: str, trust: str, 
@@ -170,7 +191,7 @@ class KnowledgeDB:
             INSERT INTO chunks (id, file_id, content, line_start, line_end, source_kind, trust, sha)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (chunk_id, file_id, content, line_start, line_end, source_kind, trust, sha))
-        self.conn.commit()
+        self._auto_commit()
         return cursor.lastrowid
 
     def add_embedding(self, chunk_rowid: int, vector: List[float]):
@@ -181,6 +202,24 @@ class KnowledgeDB:
             VALUES (?, ?)
         """, (chunk_rowid, sqlite_vec.serialize_float32(vector)))
         self.conn.commit()
+
+    def add_embeddings_batch(self, records: List[tuple[int, List[float]]]):
+        """Пакетно добавляет векторные представления для группы чанков (существенное ускорение)."""
+        if not records:
+            return
+        cursor = self.conn.cursor()
+        
+        # Подготавливаем сериализованные данные для executemany
+        batch_data = [
+            (rowid, sqlite_vec.serialize_float32(vector))
+            for rowid, vector in records
+        ]
+        
+        cursor.executemany("""
+            INSERT INTO chunks_vec(rowid, embedding)
+            VALUES (?, ?)
+        """, batch_data)
+        self._auto_commit()
         
     def search_chunks_fts(self, query: str, repo_ids: Optional[List[str]] = None, limit: int = 10) -> List[sqlite3.Row]:
         """Полнотекстовый поиск по чанкам."""

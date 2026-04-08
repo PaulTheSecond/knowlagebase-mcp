@@ -27,3 +27,26 @@ class LocalEmbedder:
         except Exception as e:
             logger.error(f"Failed to compute local embedding: {e}")
             return []
+
+    def embed_batch(self, texts: list[str], batch_size: int = 32) -> list[list[float]]:
+        """Пакетная векторизация для резкого ускорения через параллелизм Pytorch/ONNX.
+        При ошибке батча автоматически откатывается на поштучную обработку,
+        чтобы не терять весь пакет из-за одного проблемного текста.
+        """
+        if not texts:
+            return []
+        try:
+            vectors = self.model.encode(texts, batch_size=batch_size, show_progress_bar=False)
+            return vectors.tolist()
+        except Exception as e:
+            logger.warning(f"Batch embedding failed ({e}), falling back to per-item processing...")
+            # Fallback: обрабатываем каждый текст отдельно, чтобы не потерять весь батч
+            results = []
+            for i, text in enumerate(texts):
+                try:
+                    vector = self.model.encode(text)
+                    results.append(vector.tolist())
+                except Exception as item_err:
+                    logger.error(f"Failed to embed item {i}: {item_err}")
+                    results.append([])
+            return results

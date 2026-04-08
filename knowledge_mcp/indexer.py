@@ -2,8 +2,10 @@ import os
 import hashlib
 import logging
 import uuid
+import json
 from pathlib import Path
 from typing import Generator
+import concurrent.futures
 
 import pathspec
 
@@ -20,6 +22,12 @@ def hash_file(filepath: Path, chunk_size: int = 8192) -> str:
             hasher.update(chunk)
     return hasher.hexdigest()
 
+# Размер суб-батча для обработки эмбеддингов порциями (экономия RAM)
+EMBED_SUB_BATCH_SIZE = 64
+# Максимальное количество потоков для параллельного хэширования
+MAX_HASH_WORKERS = 8
+
+
 class Indexer:
     def __init__(self, db: KnowledgeDB, use_embeddings: bool = True):
         self.db = db
@@ -28,7 +36,20 @@ class Indexer:
 
     def _get_ignore_spec(self, root_path: Path) -> pathspec.PathSpec:
         """Считывает .gitignore и добавляет системные исключения."""
-        patterns = ['.git/', 'node_modules/', '.idea/', '.vs/', 'venv/', '__pycache__/', '*.log', '*.db']
+        patterns = [
+            # Системные
+            '.git/', 'node_modules/', '.idea/', '.vs/', 'venv/', '__pycache__/', '*.log', '*.db',
+            # AI-агенты и их конфиги
+            '_bmad/', '.agents/', '.ai/', '.bmad-core/', '.claude/', '.gemini/',
+            '.opencode/', '.roo/', '.github/', '.nuget/',
+            'mcp.json', 'opencode.json', '.task-cache.json',
+            'gitlab-task-collector.config.json',
+            'AGENTS.md', 'Claude.md', 'gemini.md',
+            # Конфиги сборки и IDE
+            '.editorconfig', '.arscontexta', '.mailmap', '.roomodes',
+            'Directory.Build.props', 'Directory.Packages.props',
+            'nuget.config', 'packages.txt',
+        ]
         
         gitignore_path = root_path / '.gitignore'
         if gitignore_path.exists():
@@ -70,7 +91,9 @@ class Indexer:
             return
 
         spec = self._get_ignore_spec(repo_path)
-        known_files = self.db.get_known_files(repo_id)
+        # Fix #3: Конвертируем sqlite3.Row в чистые dict для thread-safety
+        known_files_raw = self.db.get_known_files(repo_id)
+        known_files = {path: dict(row) for path, row in known_files_raw.items()}
         
         current_files = set()
         updated_count = 0
@@ -78,61 +101,154 @@ class Indexer:
         unchanged_count = 0
         deleted_count = 0
         
+        files_to_check = []
         for filepath in self._walk_files(repo_path, spec, allowed_top_level):
-            if not filepath.is_file():
-                continue
-                
-            rel_path = filepath.relative_to(repo_path).as_posix()
-            current_files.add(rel_path)
-            
+            if filepath.is_file():
+                rel_path = filepath.relative_to(repo_path).as_posix()
+                files_to_check.append((filepath, rel_path))
+                current_files.add(rel_path)
+
+        def check_file(item):
+            """Чистая функция: только чтение с диска и хэширование (никаких обращений к БД)."""
+            filepath, rel_path = item
             try:
                 mtime = filepath.stat().st_mtime
-                
                 if rel_path in known_files:
                     known = known_files[rel_path]
-                    
                     if known['mtime'] == mtime:
-                        unchanged_count += 1
-                        continue  # Файл не менялся
-                        
+                        return (rel_path, filepath, mtime, None, 'unchanged', None)
                     file_hash = hash_file(filepath)
                     if known['hash'] == file_hash:
-                        # Хэш не изменился (например, touch), просто обновим mtime в БД
+                        return (rel_path, filepath, mtime, file_hash, 'touch', None)
+                    return (rel_path, filepath, mtime, file_hash, 'updated', known['id'])
+                else:
+                    file_hash = hash_file(filepath)
+                    return (rel_path, filepath, mtime, file_hash, 'added', None)
+            except Exception as e:
+                return (rel_path, filepath, None, None, 'error', str(e))
+
+        sync_buffer = {rel_path: 'pending' for _, rel_path in files_to_check}
+        chunks_to_embed = []  # Список кортежей (content, chunk_rowid, rel_path)
+        
+        # Fix #5: Оборачиваем весь цикл в одну транзакцию вместо тысяч отдельных commit()
+        self.db.begin_transaction()
+        try:
+            # Fix #4: Ограничиваем количество потоков для предотвращения 'Too many open files'
+            with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_HASH_WORKERS) as executor:
+                # Исполняем IO-интенсивную задачу хэширования параллельно
+                results = executor.map(check_file, files_to_check)
+                
+                for res in results:
+                    rel_path, filepath, mtime, file_hash, status, old_id = res
+                    if status == 'error':
+                        logger.error(f"Error processing {rel_path}: {old_id}")
+                        sync_buffer[rel_path] = 'error'
+                    elif status == 'unchanged':
+                        unchanged_count += 1
+                        sync_buffer[rel_path] = 'completed'
+                    elif status == 'touch':
                         self.db.upsert_file(repo_id, rel_path, mtime, file_hash)
                         unchanged_count += 1
-                        continue
+                        sync_buffer[rel_path] = 'completed'
+                    elif status in ('updated', 'added'):
+                        if status == 'updated':
+                            updated_count += 1
+                        else:
+                            added_count += 1
+                        file_id = self.db.upsert_file(repo_id, rel_path, mtime, file_hash)
                         
-                    # Контент файла изменился
-                    updated_count += 1
-                    file_id = self.db.upsert_file(repo_id, rel_path, mtime, file_hash)
-                    self._reindex_file(file_id, filepath, rel_path)
-                else:
-                    # Новый файл
-                    added_count += 1
-                    file_hash = hash_file(filepath)
-                    file_id = self.db.upsert_file(repo_id, rel_path, mtime, file_hash)
-                    self._reindex_file(file_id, filepath, rel_path)
-                    
-            except Exception as e:
-                logger.error(f"Error processing {rel_path}: {e}")
+                        # Fix #7: _reindex_file возвращает 3 состояния (True/False/None)
+                        reindex_result = self._reindex_file(file_id, filepath, rel_path, chunks_to_embed)
+                        if reindex_result is True:
+                            sync_buffer[rel_path] = 'waiting_for_embedding'
+                        elif reindex_result is None:
+                            sync_buffer[rel_path] = 'skipped_parse_error'
+                        else:
+                            sync_buffer[rel_path] = 'completed'
 
-        # Удаляем из БД ушедшие с диска файлы
-        for rel_path, known in known_files.items():
-            if rel_path not in current_files:
-                self.db.delete_file(known['id'])
-                deleted_count += 1
+            # Удаляем из БД ушедшие с диска файлы
+            for rel_path, known in known_files.items():
+                if rel_path not in current_files:
+                    self.db.delete_file(known['id'])
+                    deleted_count += 1
+
+            self.db.commit_transaction()
+        except Exception as e:
+            self.db.rollback_transaction()
+            logger.error(f"Transaction failed during sync of '{repo_id}': {e}")
+            raise
+
+        # Fix #1: Батч-векторизация порциями (sub-batches) для экономии RAM
+        if self.use_embeddings and self.embedder and chunks_to_embed:
+            total_chunks = len(chunks_to_embed)
+            logger.info(f"Batch computing local embeddings for {total_chunks} chunks (sub-batches of {EMBED_SUB_BATCH_SIZE})...")
+            
+            for batch_start in range(0, total_chunks, EMBED_SUB_BATCH_SIZE):
+                batch_slice = chunks_to_embed[batch_start:batch_start + EMBED_SUB_BATCH_SIZE]
+                texts = [item[0] for item in batch_slice]
+                rowids = [item[1] for item in batch_slice]
+                rp_list = [item[2] for item in batch_slice]
+                
+                vectors = self.embedder.embed_batch(texts, batch_size=32)
+                
+                records = []
+                completed_rp = set()
+                for i, vector in enumerate(vectors):
+                    if vector:
+                        records.append((rowids[i], vector))
+                        completed_rp.add(rp_list[i])
+                        
+                if records:
+                    self.db.add_embeddings_batch(records)
+                    
+                for rp in rp_list:
+                    if rp in completed_rp:
+                        sync_buffer[rp] = 'completed'
+                    else:
+                        sync_buffer[rp] = 'error_embedding'
+                
+                # Освобождаем ссылки на тексты текущей порции
+                del texts, vectors, records
+            
+            # Освобождаем весь буфер после завершения
+            chunks_to_embed.clear()
+
+        # Финальная верификация
+        # Fix #6: Санитизируем repo_id для безопасного имени файла
+        safe_repo_id = repo_id.replace('/', '_').replace('\\', '_').replace('..', '_')
+        pending_or_error = {k: v for k, v in sync_buffer.items() if v != 'completed'}
+        report_path = self.db.db_path.parent / f"sync_report_{safe_repo_id}.json"
+        
+        if not pending_or_error:
+            logger.info(f"Verification successful: 100% of {len(sync_buffer)} files processed correctly.")
+            if report_path.exists():
+                report_path.unlink()
+        else:
+            with open(report_path, 'w', encoding='utf-8') as f:
+                json.dump({
+                    "total": len(sync_buffer),
+                    "successful": len(sync_buffer) - len(pending_or_error),
+                    "issues": pending_or_error
+                }, f, indent=2)
+            logger.error(f"Verification failed: {len(pending_or_error)} items failed. Report dumped to {report_path}")
 
         logger.info(f"Sync complete for '{repo_id}': +{added_count} ~{updated_count} -{deleted_count} (={unchanged_count} unchanged)")
 
-    def _reindex_file(self, file_id: int, filepath: Path, rel_path: str):
-        """Очищает старые чанки файла и нарезает новые."""
+    def _reindex_file(self, file_id: int, filepath: Path, rel_path: str, chunks_to_embed: list):
+        """Очищает старые чанки файла и нарезает новые.
+        
+        Returns:
+            True  — чанк добавлен в очередь на векторизацию
+            False — файл обработан успешно, но эмбеддинги не нужны (пустой файл или выключены)
+            None  — ошибка парсинга (бинарник, проблема кодировки)
+        """
         self.db.clear_file_chunks(file_id)
         
         # Базовый парсер (пока просто файл целиком — заглушка для расширенной логики)
         try:
             content = filepath.read_text(encoding='utf-8')
             if not content.strip():
-                return
+                return False
                 
             chunk_id = str(uuid.uuid4())
             lines_count = len(content.splitlines())
@@ -151,9 +267,10 @@ class Indexer:
             )
             
             if self.use_embeddings and self.embedder:
-                vector = self.embedder.embed_text(content)
-                if vector:
-                    self.db.add_embedding(chunk_rowid, vector)
+                chunks_to_embed.append((content, chunk_rowid, rel_path))
+                return True
+            return False
         except Exception as e:
             # Скипаем в случае проблем кодировок (бинарники)
             logger.warning(f"Failed parsing file {rel_path}: {e}")
+            return None
