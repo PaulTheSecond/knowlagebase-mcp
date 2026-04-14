@@ -234,6 +234,14 @@ class Indexer:
                 }, f, indent=2)
             logger.error(f"Verification failed: {len(pending_or_error)} items failed. Report dumped to {report_path}")
 
+        # Разрешаем повисшие коннекшены (cross-repo/forward references)
+        try:
+            resolved_count = self.db.resolve_pending_references()
+            if resolved_count > 0:
+                logger.info(f"Resolved {resolved_count} pending cross-repo references.")
+        except Exception as e:
+            logger.error(f"Error resolving pending references: {e}")
+
         logger.info(f"Sync complete for '{repo_id}': +{added_count} ~{updated_count} -{deleted_count} (={unchanged_count} unchanged)")
 
     def _reindex_file(self, file_id: int, filepath: Path, rel_path: str, chunks_to_embed: list):
@@ -256,6 +264,9 @@ class Indexer:
                 # Symbol-based chunking для кода
                 parser = CodeParser()
                 symbols = parser.parse_file(filepath, LANGUAGE_MAP[ext])
+                # СЛОВАРЬ для маппинга source_name -> symbol_id
+                local_symbols_map = {}
+                
                 for symbol in symbols:
                     if not symbol.body.strip():
                         continue
@@ -272,6 +283,9 @@ class Indexer:
                         symbol.line_start, symbol.line_end, 
                         symbol.signature, chunk_id
                     )
+                    local_symbols_map[symbol.qualified_name] = symbol_id
+                    if not local_symbols_map.get("file_level"):
+                        local_symbols_map["file_level"] = symbol_id
                     
                     if self.use_embeddings and self.embedder:
                         chunks_to_embed.append((symbol.body, chunk_rowid, rel_path))
@@ -280,8 +294,24 @@ class Indexer:
                 # Связи
                 edges = parser.extract_edges(filepath, LANGUAGE_MAP[ext])
                 for edge in edges:
-                    # В этой фазе мы не резолвим связи полностью, оставляем для ファзы 2/3
-                    pass
+                    source_id = local_symbols_map.get(edge.source_name)
+                    if not source_id:
+                        continue # Cannot link edge if source symbol wasn't saved
+                        
+                    # 1. Пытаемся найти локально (в этом же файле)
+                    target_id = local_symbols_map.get(edge.target_name)
+                    
+                    # 2. Пытаемся найти в базе
+                    if not target_id:
+                        targets = self.db.find_symbols(edge.target_name, limit=1)
+                        if targets:
+                            target_id = targets[0]['id']
+                            
+                    # 3. Сохраняем edge или unresolved ref
+                    if target_id:
+                        self.db.add_symbol_edge(source_id, target_id, edge.kind)
+                    else:
+                        self.db.add_unresolved_ref(source_id, edge.target_name, edge.kind)
 
             elif ext in ('.md', '.mdx') or rel_path.startswith(('docs/', 'knowledge/')):
                 # Section-based chunking для документации

@@ -259,6 +259,30 @@ class KnowledgeDB:
         """, (source_id, target_qualified_name, kind))
         self._auto_commit()
 
+    def resolve_pending_references(self) -> int:
+        """Пытается найти таргеты для ссылок из unresolved_refs."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM unresolved_refs")
+        unresolved = cursor.fetchall()
+        
+        resolved_ids = []
+        for ref in unresolved:
+            targets = self.find_symbols(ref['target_qualified_name'], limit=1)
+            if targets:
+                self.add_symbol_edge(ref['source_id'], targets[0]['id'], ref['kind'])
+                resolved_ids.append(ref['id'])
+                
+        if resolved_ids:
+            # Batch delete
+            step = 900 # SQLite limit for parameters
+            for i in range(0, len(resolved_ids), step):
+                batch = resolved_ids[i:i+step]
+                placeholders = ','.join('?' for _ in batch)
+                cursor.execute(f"DELETE FROM unresolved_refs WHERE id IN ({placeholders})", batch)
+            self._auto_commit()
+            
+        return len(resolved_ids)
+
     def find_symbols(self, name_pattern: str, kind: Optional[str] = None, repo_ids: Optional[List[str]] = None, limit: int = 20) -> List[sqlite3.Row]:
         cursor = self.conn.cursor()
         sql = '''
