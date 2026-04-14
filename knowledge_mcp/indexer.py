@@ -11,6 +11,8 @@ import pathspec
 
 from .db import KnowledgeDB
 from .embeddings import LocalEmbedder
+from .code_parser import CodeParser, LANGUAGE_MAP
+from .markdown_parser import MarkdownParser
 
 logger = logging.getLogger(__name__)
 
@@ -235,7 +237,7 @@ class Indexer:
         logger.info(f"Sync complete for '{repo_id}': +{added_count} ~{updated_count} -{deleted_count} (={unchanged_count} unchanged)")
 
     def _reindex_file(self, file_id: int, filepath: Path, rel_path: str, chunks_to_embed: list):
-        """Очищает старые чанки файла и нарезает новые.
+        """Очищает старые чанки и символы файла и нарезает/парсит новые.
         
         Returns:
             True  — чанк добавлен в очередь на векторизацию
@@ -243,33 +245,85 @@ class Indexer:
             None  — ошибка парсинга (бинарник, проблема кодировки)
         """
         self.db.clear_file_chunks(file_id)
+        self.db.clear_file_symbols(file_id)
         
-        # Базовый парсер (пока просто файл целиком — заглушка для расширенной логики)
+        ext = filepath.suffix.lower()
+
         try:
-            content = filepath.read_text(encoding='utf-8')
-            if not content.strip():
-                return False
+            added_embedding = False
+            
+            if ext in LANGUAGE_MAP:
+                # Symbol-based chunking для кода
+                parser = CodeParser()
+                symbols = parser.parse_file(filepath, LANGUAGE_MAP[ext])
+                for symbol in symbols:
+                    if not symbol.body.strip():
+                        continue
+                        
+                    chunk_id = str(uuid.uuid4())
+                    chunk_rowid = self.db.add_chunk(
+                        chunk_id=chunk_id, file_id=file_id, content=symbol.body, 
+                        source_kind='code', trust='verified',
+                        line_start=symbol.line_start, line_end=symbol.line_end
+                    )
+                    symbol_id = self.db.add_symbol(
+                        file_id, symbol.name, symbol.qualified_name,
+                        symbol.kind, symbol.language, 
+                        symbol.line_start, symbol.line_end, 
+                        symbol.signature, chunk_id
+                    )
+                    
+                    if self.use_embeddings and self.embedder:
+                        chunks_to_embed.append((symbol.body, chunk_rowid, rel_path))
+                        added_embedding = True
                 
-            chunk_id = str(uuid.uuid4())
-            lines_count = len(content.splitlines())
+                # Связи
+                edges = parser.extract_edges(filepath, LANGUAGE_MAP[ext])
+                for edge in edges:
+                    # В этой фазе мы не резолвим связи полностью, оставляем для ファзы 2/3
+                    pass
+
+            elif ext in ('.md', '.mdx') or rel_path.startswith(('docs/', 'knowledge/')):
+                # Section-based chunking для документации
+                md_parser = MarkdownParser()
+                sections = md_parser.parse_file(filepath)
+                for section in sections:
+                    if not section.content.strip():
+                        continue
+                        
+                    chunk_id = str(uuid.uuid4())
+                    chunk_rowid = self.db.add_chunk(
+                        chunk_id=chunk_id, file_id=file_id, content=section.content,
+                        source_kind='docs', trust='hint',
+                        line_start=section.line_start, line_end=section.line_end
+                    )
+                    if self.use_embeddings and self.embedder:
+                        chunks_to_embed.append((section.content, chunk_rowid, rel_path))
+                        added_embedding = True
             
-            source_kind = 'docs' if rel_path.startswith(('docs/', 'knowledge/')) or rel_path.endswith('.md') else 'code'
-            trust = 'hint' if source_kind == 'docs' else 'verified'
-            
-            chunk_rowid = self.db.add_chunk(
-                chunk_id=chunk_id,
-                file_id=file_id,
-                content=content,
-                source_kind=source_kind,
-                trust=trust,
-                line_start=1,
-                line_end=lines_count
-            )
-            
-            if self.use_embeddings and self.embedder:
-                chunks_to_embed.append((content, chunk_rowid, rel_path))
-                return True
-            return False
+            else:
+                # Fallback: файл целиком
+                content = filepath.read_text(encoding='utf-8')
+                if not content.strip():
+                    return False
+                    
+                chunk_id = str(uuid.uuid4())
+                lines_count = len(content.splitlines())
+                
+                source_kind = 'code' # Фаллбек для прочих текстовых файлов (txt, json, yaml etc)
+                trust = 'verified'
+                
+                chunk_rowid = self.db.add_chunk(
+                    chunk_id=chunk_id, file_id=file_id, content=content,
+                    source_kind=source_kind, trust=trust,
+                    line_start=1, line_end=lines_count
+                )
+                
+                if self.use_embeddings and self.embedder:
+                    chunks_to_embed.append((content, chunk_rowid, rel_path))
+                    added_embedding = True
+
+            return added_embedding
         except Exception as e:
             # Скипаем в случае проблем кодировок (бинарники)
             logger.warning(f"Failed parsing file {rel_path}: {e}")

@@ -98,6 +98,56 @@ async def list_tools() -> list[types.Tool]:
                 },
                 "required": ["repo_id", "repo_path"]
             }
+        ),
+        types.Tool(
+            name="knowledge_find_symbol",
+            description="Find a code symbol (class, method, interface, etc.) by its name or pattern. Use asterisks for wildcards (e.g. '*Repository*').",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name_pattern": {"type": "string", "description": "The name or wildcard pattern of the symbol."},
+                    "kind": {"type": "string", "description": "Optional kind of symbol (class, method, interface, property, etc)."},
+                    "repo_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional list of repo_ids to restrict the search."
+                    }
+                },
+                "required": ["name_pattern"]
+            }
+        ),
+        types.Tool(
+            name="knowledge_get_callers",
+            description="Find all symbols that call or reference the specified symbol by its numeric ID.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbol_id": {"type": "integer", "description": "The exact numeric ID of the target symbol."}
+                },
+                "required": ["symbol_id"]
+            }
+        ),
+        types.Tool(
+            name="knowledge_get_callees",
+            description="Find all symbols that are called or referenced by the specified symbol by its numeric ID.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbol_id": {"type": "integer", "description": "The exact numeric ID of the source symbol."}
+                },
+                "required": ["symbol_id"]
+            }
+        ),
+        types.Tool(
+            name="knowledge_get_hierarchy",
+            description="Get the inheritance and implementation hierarchy for the specified symbol by its numeric ID.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbol_id": {"type": "integer", "description": "The exact numeric ID of the symbol."}
+                },
+                "required": ["symbol_id"]
+            }
         )
     ]
 
@@ -223,6 +273,64 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         except Exception as e:
             logger.error(f"Sync failed: {e}")
             return [types.TextContent(type="text", text=f"Failed to synchronize repository: {e}")]
+            
+    elif name == "knowledge_find_symbol":
+        pattern = arguments.get("name_pattern")
+        kind = arguments.get("kind")
+        repo_ids = arguments.get("repo_ids", [])
+        
+        if not pattern:
+            return [types.TextContent(type="text", text="Error: 'name_pattern' argument is required.")]
+            
+        try:
+            results = db.find_symbols(pattern, kind=kind, repo_ids=repo_ids, limit=20)
+            if not results:
+                return [types.TextContent(type="text", text=f"No symbols found matching '{pattern}'.")]
+                
+            formatted = []
+            for r in results:
+                formatted.append(
+                    f"--- Symbol ID: {r['id']} ---\n"
+                    f"**Name**: `{r['name']}` (Qualified: `{r['qualified_name']}`)\n"
+                    f"**Repository**: `{r['repo_id']}`\n"
+                    f"**File**: `{r['path']}` (Lines: {r['line_start']}-{r['line_end']})\n"
+                    f"**Kind**: {r['kind']} ({r['language']})\n"
+                    f"**Signature**: `{r['signature']}`\n"
+                )
+            return [types.TextContent(type="text", text="\n".join(formatted))]
+        except Exception as e:
+            logger.error(f"Find symbol failed: {e}")
+            return [types.TextContent(type="text", text=f"Database query error: {e}")]
+
+    elif name in ("knowledge_get_callers", "knowledge_get_callees", "knowledge_get_hierarchy"):
+        symbol_id = arguments.get("symbol_id")
+        if not symbol_id:
+            return [types.TextContent(type="text", text="Error: 'symbol_id' is required.")]
+            
+        try:
+            if name == "knowledge_get_callers":
+                results = db.get_callers(symbol_id)
+                header = f"Callers for symbol ID {symbol_id}:"
+            elif name == "knowledge_get_callees":
+                results = db.get_callees(symbol_id)
+                header = f"Callees of symbol ID {symbol_id}:"
+            else:
+                results = db.get_hierarchy(symbol_id)
+                header = f"Hierarchy for symbol ID {symbol_id}:"
+                
+            if not results:
+                return [types.TextContent(type="text", text=f"No graph edges found for symbol {symbol_id} in this context.")]
+                
+            formatted = [header]
+            for r in results:
+                edge_kind = r['edge_kind']
+                formatted.append(
+                    f"- [{edge_kind}] ID: {r['id']} | `{r['qualified_name']}` ({r['kind']} in {r['repo_id']}/{r['path']})"
+                )
+            return [types.TextContent(type="text", text="\n".join(formatted))]
+        except Exception as e:
+            logger.error(f"Graph query failed: {e}")
+            return [types.TextContent(type="text", text=f"Database query error: {e}")]
         
     else:
         raise ValueError(f"Unknown tool: {name}")

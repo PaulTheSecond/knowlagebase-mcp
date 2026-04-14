@@ -109,6 +109,52 @@ class KnowledgeDB:
             }
         ]
 
+        # Добавляем новую миграцию
+        migrations.append({
+            "id": "20260414_04_symbols_graph",
+            "up": """
+                CREATE TABLE IF NOT EXISTS symbols (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    file_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    qualified_name TEXT,
+                    kind TEXT NOT NULL,
+                    language TEXT NOT NULL,
+                    line_start INTEGER,
+                    line_end INTEGER,
+                    signature TEXT,
+                    chunk_id TEXT,
+                    FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE,
+                    FOREIGN KEY(chunk_id) REFERENCES chunks(id) ON DELETE SET NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS symbol_edges (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_id INTEGER NOT NULL,
+                    target_id INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    FOREIGN KEY(source_id) REFERENCES symbols(id) ON DELETE CASCADE,
+                    FOREIGN KEY(target_id) REFERENCES symbols(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS unresolved_refs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_id INTEGER NOT NULL,
+                    target_qualified_name TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    FOREIGN KEY(source_id) REFERENCES symbols(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
+                CREATE INDEX IF NOT EXISTS idx_symbols_qualified ON symbols(qualified_name);
+                CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id);
+                CREATE INDEX IF NOT EXISTS idx_symbols_kind ON symbols(kind);
+                CREATE INDEX IF NOT EXISTS idx_edges_source ON symbol_edges(source_id);
+                CREATE INDEX IF NOT EXISTS idx_edges_target ON symbol_edges(target_id);
+                CREATE INDEX IF NOT EXISTS idx_edges_kind ON symbol_edges(kind);
+            """
+        })
+
         for migration in migrations:
             if migration["id"] not in applied_migrations:
                 logger.info(f"Applying sqlite migration: {migration['id']}")
@@ -180,6 +226,101 @@ class KnowledgeDB:
         cursor = self.conn.cursor()
         cursor.execute("DELETE FROM chunks WHERE file_id = ?", (file_id,))
         self._auto_commit()
+
+    def clear_file_symbols(self, file_id: int):
+        """Удаляет все символы, привязанные к файлу (связи удалятся каскадно)."""
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM symbols WHERE file_id = ?", (file_id,))
+        self._auto_commit()
+
+    def add_symbol(self, file_id: int, name: str, qualified_name: str, kind: str, 
+                   language: str, line_start: int, line_end: int, signature: str, chunk_id: str) -> int:
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT INTO symbols (file_id, name, qualified_name, kind, language, line_start, line_end, signature, chunk_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (file_id, name, qualified_name, kind, language, line_start, line_end, signature, chunk_id))
+        self._auto_commit()
+        return cursor.lastrowid
+
+    def add_symbol_edge(self, source_id: int, target_id: int, kind: str):
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT INTO symbol_edges (source_id, target_id, kind)
+            VALUES (?, ?, ?)
+        """, (source_id, target_id, kind))
+        self._auto_commit()
+
+    def add_unresolved_ref(self, source_id: int, target_qualified_name: str, kind: str):
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT INTO unresolved_refs (source_id, target_qualified_name, kind)
+            VALUES (?, ?, ?)
+        """, (source_id, target_qualified_name, kind))
+        self._auto_commit()
+
+    def find_symbols(self, name_pattern: str, kind: Optional[str] = None, repo_ids: Optional[List[str]] = None, limit: int = 20) -> List[sqlite3.Row]:
+        cursor = self.conn.cursor()
+        sql = '''
+            SELECT s.*, f.repo_id, f.path
+            FROM symbols s
+            JOIN files f ON s.file_id = f.id
+            WHERE (s.name LIKE ? OR s.qualified_name LIKE ?)
+        '''
+        # Replace * with % for SQL LIKE
+        sql_pattern = name_pattern.replace('*', '%')
+        if '%' not in sql_pattern:
+            sql_pattern = f"%{sql_pattern}%"
+            
+        params = [sql_pattern, sql_pattern]
+        
+        if kind:
+            sql += " AND s.kind = ?"
+            params.append(kind)
+            
+        if repo_ids:
+            placeholders = ','.join('?' for _ in repo_ids)
+            sql += f" AND f.repo_id IN ({placeholders})"
+            params.extend(repo_ids)
+            
+        sql += " LIMIT ?"
+        params.append(limit)
+        
+        cursor.execute(sql, params)
+        return cursor.fetchall()
+        
+    def get_callers(self, symbol_id: int) -> List[sqlite3.Row]:
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT s.*, f.repo_id, f.path, e.kind as edge_kind
+            FROM symbol_edges e
+            JOIN symbols s ON e.source_id = s.id
+            JOIN files f ON s.file_id = f.id
+            WHERE e.target_id = ?
+        ''', (symbol_id,))
+        return cursor.fetchall()
+
+    def get_callees(self, symbol_id: int) -> List[sqlite3.Row]:
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT s.*, f.repo_id, f.path, e.kind as edge_kind
+            FROM symbol_edges e
+            JOIN symbols s ON e.target_id = s.id
+            JOIN files f ON s.file_id = f.id
+            WHERE e.source_id = ?
+        ''', (symbol_id,))
+        return cursor.fetchall()
+
+    def get_hierarchy(self, symbol_id: int) -> List[sqlite3.Row]:
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT s.*, f.repo_id, f.path, e.kind as edge_kind
+            FROM symbol_edges e
+            JOIN symbols s ON e.target_id = s.id
+            JOIN files f ON s.file_id = f.id
+            WHERE e.source_id = ? AND e.kind IN ('INHERITS', 'IMPLEMENTS')
+        ''', (symbol_id,))
+        return cursor.fetchall()
 
     def add_chunk(self, chunk_id: str, file_id: int, content: str, 
                   source_kind: str, trust: str, 

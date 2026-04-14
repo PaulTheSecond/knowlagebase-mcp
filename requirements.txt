@@ -6,3 +6,8 @@ uvicorn
 sqlite-vec
 sentence-transformers
 questionary
+tree-sitter
+tree-sitter-c-sharp
+tree-sitter-typescript
+tree-sitter-javascript
+tree-sitter-sql
