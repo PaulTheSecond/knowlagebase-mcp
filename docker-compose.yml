@@ -5,20 +5,20 @@ services:
       - "8000:8000"
     volumes:
       # Volume для сохранения SQLite БД между перезапусками контейнера
-      - C:\Repos\impactos.knowlagebase\data:/data
+      - ./data:/data
       # Папка с исходниками (монтируется как read-only). По умолчанию это локальная папка ./src
       # Если ваши проекты лежат в другом месте, просто создайте .env файл и укажите: REPOS_DIR=/path/to/my/projects
       - ${REPOS_DIR:-./src}:/repos:ro
       # Проброс кэша HuggingFace, чтобы не скачивать модель при каждом рестарте контейнера
       - ${HF_CACHE:-~/.cache/huggingface}:/root/.cache/huggingface
     environment:
-      - DB_PATH=/data/knowledge.db
+      - DB_PATH=/data/knowledge_roslyn.db
     
     # Ограничение ресурсов: не позволяем контейнеру съесть всю оперативку и CPU хоста
     deploy:
       resources:
         limits:
-          memory: 2G
+          memory: 4G
           cpus: "2.0"
         reservations:
           memory: 512M
@@ -28,4 +28,4 @@ services:
     restart: unless-stopped
 
     # Команда по умолчанию: поднимает HTTP сервер триггеров
-    command: python -m knowledge_mcp.main --db-path /data/knowledge.db serve --host 0.0.0.0 --port 8000
+    command: python -m knowledge_mcp.main --db-path /data/knowledge_roslyn.db serve --host 0.0.0.0 --port 8000

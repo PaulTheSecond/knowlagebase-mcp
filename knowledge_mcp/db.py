@@ -346,6 +346,45 @@ class KnowledgeDB:
         ''', (symbol_id,))
         return cursor.fetchall()
 
+    def get_impact_analysis(self, symbol_id: int, max_depth: int = 3) -> List[Dict[str, Any]]:
+        """
+        Рекурсивный поиск зависимостей (кто сломается, если изменить этот символ).
+        Возвращает список словарей с найденными символами и их 'depth'.
+        """
+        cursor = self.conn.cursor()
+        
+        visited = set()
+        queue = [(symbol_id, 1)] # (id, depth)
+        impacted = []
+        
+        while queue:
+            current_id, depth = queue.pop(0)
+            if depth > max_depth:
+                continue
+                
+            # Ищем тех, кто вызывает (CALLS) или наследует (INHERITS, IMPLEMENTS) от current_id
+            cursor.execute('''
+                SELECT s.*, f.repo_id, f.path, e.kind as edge_kind
+                FROM symbol_edges e
+                JOIN symbols s ON e.source_id = s.id
+                JOIN files f ON s.file_id = f.id
+                WHERE e.target_id = ? AND e.kind IN ('CALLS', 'INHERITS', 'IMPLEMENTS', 'IMPORTS', 'USES')
+            ''', (current_id,))
+            
+            callers = cursor.fetchall()
+            for r in callers:
+                caller_id = r['id']
+                if caller_id not in visited:
+                    visited.add(caller_id)
+                    impacted.append({
+                        'symbol': r,
+                        'depth': depth,
+                        'edge_kind': r['edge_kind']
+                    })
+                    queue.append((caller_id, depth + 1))
+                    
+        return impacted
+
     def add_chunk(self, chunk_id: str, file_id: int, content: str, 
                   source_kind: str, trust: str, 
                   line_start: Optional[int] = None, line_end: Optional[int] = None, 
@@ -386,6 +425,17 @@ class KnowledgeDB:
         """, batch_data)
         self._auto_commit()
         
+    def get_chunks_without_embeddings(self, repo_id: str) -> List[tuple[str, int, str]]:
+        """Возвращает список чанков, у которых еще нет векторного представления (recovery после сбоя)."""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT c.content, c.rowid, f.path
+            FROM chunks c
+            JOIN files f ON c.file_id = f.id
+            WHERE f.repo_id = ? AND c.rowid NOT IN (SELECT rowid FROM chunks_vec)
+        ''', (repo_id,))
+        return [(row[0], row[1], row[2]) for row in cursor.fetchall()]
+        
     def search_chunks_fts(self, query: str, repo_ids: Optional[List[str]] = None, limit: int = 10) -> List[sqlite3.Row]:
         """Полнотекстовый поиск по чанкам."""
         cursor = self.conn.cursor()
@@ -418,11 +468,46 @@ class KnowledgeDB:
         cursor.execute(sql, params)
         return cursor.fetchall()
 
+    def search_chunks_graph(self, query: str, repo_ids: Optional[List[str]] = None, limit: int = 10) -> List[sqlite3.Row]:
+        """Графовый поиск: поиск релевантных кусков кода по именам из запроса."""
+        import re
+        cursor = self.conn.cursor()
+        
+        # Извлекаем слова-кандидаты (длина > 3)
+        words = set(re.findall(r'\b[a-zA-Z_][a-zA-Z0-9_]*\b', query))
+        candidates = [w for w in words if len(w) > 3]
+        if not candidates:
+            return []
+            
+        placeholders = ','.join('?' for _ in candidates)
+        params = list(candidates)
+        
+        sql = f'''
+            SELECT c.id, c.content, c.source_kind, c.trust, c.line_start, c.line_end, 
+                   f.repo_id, f.path, 1.0 as rank
+            FROM symbols s
+            JOIN chunks c ON s.chunk_id = c.id
+            JOIN files f ON c.file_id = f.id
+            WHERE s.name IN ({placeholders}) COLLATE NOCASE
+        '''
+        
+        if repo_ids:
+            repo_placeholders = ','.join('?' for _ in repo_ids)
+            sql += f" AND f.repo_id IN ({repo_placeholders})"
+            params.extend(repo_ids)
+            
+        sql += " LIMIT ?"
+        params.append(limit)
+        
+        cursor.execute(sql, params)
+        return cursor.fetchall()
+
     def search_chunks_hybrid(self, query: str, query_vector: List[float], repo_ids: Optional[List[str]] = None, limit: int = 10) -> List[sqlite3.Row]:
-        """Гибридный поиск RRF: объединяет FTS5 и KNN по векторам."""
+        """Гибридный поиск RRF: объединяет FTS5, KNN по векторам, и Graph Search (Тройной гибрид)."""
         cursor = self.conn.cursor()
         
         fts_res = self.search_chunks_fts(query, repo_ids, limit=50)
+        graph_res = self.search_chunks_graph(query, repo_ids, limit=20)
         
         vec_sql = '''
             SELECT c.id, c.content, c.source_kind, c.trust, c.line_start, c.line_end, 
@@ -447,16 +532,25 @@ class KnowledgeDB:
         scores = {}
         chunks_map = {}
         
+        # FTS5
         for i, row in enumerate(fts_res):
             chunk_id = row['id']
             chunks_map[chunk_id] = row
             scores[chunk_id] = 1.0 / (K + i + 1)
             
+        # Vector Embeddings
         for i, row in enumerate(vec_res):
             chunk_id = row['id']
             if chunk_id not in chunks_map:
                 chunks_map[chunk_id] = row
             scores[chunk_id] = scores.get(chunk_id, 0) + (1.0 / (K + i + 1))
+            
+        # Graph (с бустом x2 за точное совпадение имени)
+        for i, row in enumerate(graph_res):
+            chunk_id = row['id']
+            if chunk_id not in chunks_map:
+                chunks_map[chunk_id] = row
+            scores[chunk_id] = scores.get(chunk_id, 0) + (2.0 / (K + i + 1))
             
         sorted_results = sorted(scores.items(), key=lambda x: x[1], reverse=True)
         return [chunks_map[cid] for cid, _ in sorted_results[:limit]]

@@ -48,7 +48,7 @@ async def list_tools() -> list[types.Tool]:
             name="knowledge_search",
             description=(
                 "Search the local knowledge base across multiple repositories. "
-                "Uses hybrid search (Full-Text + Vector Embeddings) for high recall. "
+                "Uses triple hybrid search (Full-Text + Vector Embeddings + Graph routing) for high recall. "
                 "Returns relevant code and documentation chunks with trust levels ('verified' for code, 'hint' for docs)."
             ),
             inputSchema={
@@ -145,6 +145,18 @@ async def list_tools() -> list[types.Tool]:
                 "type": "object",
                 "properties": {
                     "symbol_id": {"type": "integer", "description": "The exact numeric ID of the symbol."}
+                },
+                "required": ["symbol_id"]
+            }
+        ),
+        types.Tool(
+            name="knowledge_impact_analysis",
+            description="Perform a recursive graph traversal to find all symbols and files that depend on the specified symbol. Useful for blast radius estimation.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbol_id": {"type": "integer", "description": "The exact numeric ID of the target symbol."},
+                    "max_depth": {"type": "integer", "description": "Max recursion depth (default 3, max 5)."}
                 },
                 "required": ["symbol_id"]
             }
@@ -330,6 +342,35 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             return [types.TextContent(type="text", text="\n".join(formatted))]
         except Exception as e:
             logger.error(f"Graph query failed: {e}")
+            return [types.TextContent(type="text", text=f"Database query error: {e}")]
+
+    elif name == "knowledge_impact_analysis":
+        symbol_id = arguments.get("symbol_id")
+        max_depth = arguments.get("max_depth", 3)
+        if not symbol_id:
+            return [types.TextContent(type="text", text="Error: 'symbol_id' is required.")]
+            
+        try:
+            results = db.get_impact_analysis(symbol_id, max_depth=max_depth)
+            if not results:
+                return [types.TextContent(type="text", text=f"No dependent symbols found for symbol {symbol_id} within depth {max_depth}.")]
+                
+            formatted = [f"Impact Analysis for symbol ID {symbol_id} (max depth {max_depth}):"]
+            current_depth = 0
+            for item in sorted(results, key=lambda x: x['depth']):
+                if item['depth'] != current_depth:
+                    current_depth = item['depth']
+                    formatted.append(f"\n--- Depth {current_depth} Dependencies ---")
+                
+                r = item['symbol']
+                edge_kind = item['edge_kind']
+                formatted.append(
+                    f"- [{edge_kind}] ID: {r['id']} | `{r['qualified_name']}` ({r['kind']} in {r['repo_id']}/{r['path']})"
+                )
+                
+            return [types.TextContent(type="text", text="\n".join(formatted))]
+        except Exception as e:
+            logger.error(f"Impact analysis failed: {e}")
             return [types.TextContent(type="text", text=f"Database query error: {e}")]
         
     else:

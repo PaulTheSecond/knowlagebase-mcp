@@ -24,8 +24,8 @@ def hash_file(filepath: Path, chunk_size: int = 8192) -> str:
             hasher.update(chunk)
     return hasher.hexdigest()
 
-# Размер суб-батча для обработки эмбеддингов порциями (экономия RAM)
-EMBED_SUB_BATCH_SIZE = 64
+# Размер суб-батча для обработки эмбеддингов порциями (строгая экономия RAM для 2GB WSL)
+EMBED_SUB_BATCH_SIZE = 16
 # Максимальное количество потоков для параллельного хэширования
 MAX_HASH_WORKERS = 8
 
@@ -93,6 +93,63 @@ class Indexer:
             return
 
         spec = self._get_ignore_spec(repo_path)
+        
+        # Запуск Roslyn для .NET проектов (Semantic Precision)
+        import subprocess, json
+        self.csharp_cache = {}
+        
+        # Оптимизированный поиск .sln файлов с уважением к .gitignore
+        csharp_projects = []
+        for filepath in self._walk_files(repo_path, spec):
+            if filepath.suffix == '.sln':
+                csharp_projects.append(filepath)
+                
+        if not csharp_projects:
+            for filepath in self._walk_files(repo_path, spec):
+                if filepath.suffix == '.csproj':
+                    csharp_projects.append(filepath)
+            
+        parser_dll = Path(__file__).parent.parent / "RoslynParser" / "bin" / "Release" / "net8.0" / "RoslynParser.dll"
+        for proj in csharp_projects:
+            if "RoslynParser" in str(proj): continue
+            
+            logger.info(f"Running Roslyn semantic analysis on {proj}...")
+            cmd = ["dotnet", str(parser_dll), str(proj)]
+            if not parser_dll.exists():
+                cmd = ["dotnet", "run", "-c", "Release", "--project", str(Path(__file__).parent.parent / "RoslynParser" / "RoslynParser.csproj"), "--", str(proj)]
+                
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            if res.returncode == 0:
+                try:
+                    data = json.loads(res.stdout)
+                    
+                    # Кэшируем resolve во избежание миллионов обращений к диску по Docker Volume
+                    path_resolved_cache = {}
+                    def get_resolved(path_str):
+                        if path_str not in path_resolved_cache:
+                            path_resolved_cache[path_str] = Path(path_str).resolve()
+                        return path_resolved_cache[path_str]
+                    
+                    for s in data.get('symbols', []):
+                        fp = get_resolved(s['file_path'])
+                        if fp not in self.csharp_cache:
+                            self.csharp_cache[fp] = {'symbols': [], 'edges': []}
+                        self.csharp_cache[fp]['symbols'].append(s)
+                        
+                    id_to_file = {}
+                    for s in data.get('symbols', []):
+                        id_to_file[s['ast_node_id']] = get_resolved(s['file_path'])
+                        
+                    for e in data.get('edges', []):
+                        if e['source_ast_id'] in id_to_file:
+                            fp = id_to_file[e['source_ast_id']]
+                            self.csharp_cache[fp]['edges'].append(e)
+                            
+                except Exception as ex:
+                    logger.error(f"Failed to parse Roslyn output for {proj}: {ex}")
+            else:
+                logger.error(f"Roslyn analysis failed for {proj}: {res.stderr}")
+
         # Fix #3: Конвертируем sqlite3.Row в чистые dict для thread-safety
         known_files_raw = self.db.get_known_files(repo_id)
         known_files = {path: dict(row) for path, row in known_files_raw.items()}
@@ -103,6 +160,7 @@ class Indexer:
         unchanged_count = 0
         deleted_count = 0
         
+        logger.info("Walking directory tree to collect files...")
         files_to_check = []
         for filepath in self._walk_files(repo_path, spec, allowed_top_level):
             if filepath.is_file():
@@ -138,9 +196,18 @@ class Indexer:
             # Fix #4: Ограничиваем количество потоков для предотвращения 'Too many open files'
             with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_HASH_WORKERS) as executor:
                 # Исполняем IO-интенсивную задачу хэширования параллельно
+                total_files = len(files_to_check)
+                logger.info(f"Found {total_files} files to check. Starting content hashing and AST parsing...")
                 results = executor.map(check_file, files_to_check)
                 
+                processed = 0
+                log_step = max(1, total_files // 10) if total_files > 0 else 1
+                
                 for res in results:
+                    processed += 1
+                    if processed % log_step == 0 or processed == total_files:
+                        logger.info(f"Scan progress: {processed}/{total_files} files ({int(processed/total_files*100)}%)")
+                        
                     rel_path, filepath, mtime, file_hash, status, old_id = res
                     if status == 'error':
                         logger.error(f"Error processing {rel_path}: {old_id}")
@@ -180,18 +247,29 @@ class Indexer:
             logger.error(f"Transaction failed during sync of '{repo_id}': {e}")
             raise
 
+        # Восстанавливаем эмбеддинги для чанков, которые есть в БД, но выпали из-за OOM (мягкое восстановление)
+        if self.use_embeddings:
+            missing = self.db.get_chunks_without_embeddings(repo_id)
+            if missing:
+                logger.info(f"Recovery: Found {len(missing)} text chunks in DB missing vector embeddings. Queuing them now.")
+                chunks_to_embed.extend(missing)
+
         # Fix #1: Батч-векторизация порциями (sub-batches) для экономии RAM
         if self.use_embeddings and self.embedder and chunks_to_embed:
             total_chunks = len(chunks_to_embed)
             logger.info(f"Batch computing local embeddings for {total_chunks} chunks (sub-batches of {EMBED_SUB_BATCH_SIZE})...")
             
+            processed_chunks = 0
             for batch_start in range(0, total_chunks, EMBED_SUB_BATCH_SIZE):
                 batch_slice = chunks_to_embed[batch_start:batch_start + EMBED_SUB_BATCH_SIZE]
                 texts = [item[0] for item in batch_slice]
                 rowids = [item[1] for item in batch_slice]
                 rp_list = [item[2] for item in batch_slice]
                 
-                vectors = self.embedder.embed_batch(texts, batch_size=32)
+                vectors = self.embedder.embed_batch(texts, batch_size=8)
+                
+                processed_chunks += len(batch_slice)
+                logger.info(f"Embedding progress: {processed_chunks}/{total_chunks} chunks ({int(processed_chunks/total_chunks*100)}%)")
                 
                 records = []
                 completed_rp = set()
@@ -202,6 +280,9 @@ class Indexer:
                         
                 if records:
                     self.db.add_embeddings_batch(records)
+                
+                import gc
+                gc.collect()
                     
                 for rp in rp_list:
                     if rp in completed_rp:
@@ -260,7 +341,44 @@ class Indexer:
         try:
             added_embedding = False
             
-            if ext in LANGUAGE_MAP:
+            if ext == '.cs':
+                # Используем кэш от RoslynParser, чтобы избежать синтаксического парсинга Tree-sitter
+                cache_hit = getattr(self, 'csharp_cache', {}).get(filepath.resolve())
+                if cache_hit:
+                    local_symbols_map = {}
+                    
+                    for s in cache_hit['symbols']:
+                        chunk_id = str(uuid.uuid4())
+                        chunk_rowid = self.db.add_chunk(
+                            chunk_id=chunk_id, file_id=file_id, content=s['body'], 
+                            source_kind='code', trust='verified',
+                            line_start=s['line_start'], line_end=s['line_end']
+                        )
+                        symbol_id = self.db.add_symbol(
+                            file_id, s['name'], s['qualified_name'],
+                            s['kind'], s['language'], 
+                            s['line_start'], s['line_end'], 
+                            s['signature'], chunk_id
+                        )
+                        local_symbols_map[s['ast_node_id']] = symbol_id
+                        
+                        if self.use_embeddings and self.embedder:
+                            chunks_to_embed.append((s['body'], chunk_rowid, rel_path))
+                            added_embedding = True
+                            
+                    for e in cache_hit['edges']:
+                        source_id = local_symbols_map.get(e['source_ast_id'])
+                        if not source_id: continue
+                        
+                        target_name = e['target_qualified_name']
+                        targets = self.db.find_symbols(target_name, limit=1)
+                        if targets:
+                            self.db.add_symbol_edge(source_id, targets[0]['id'], e['kind'])
+                        else:
+                            self.db.add_unresolved_ref(source_id, target_name, e['kind'])
+                return added_embedding
+
+            elif ext in LANGUAGE_MAP and ext != '.cs':
                 # Symbol-based chunking для кода
                 parser = CodeParser()
                 symbols = parser.parse_file(filepath, LANGUAGE_MAP[ext])
