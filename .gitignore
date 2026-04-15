@@ -41,6 +41,12 @@ _test_*.py
 _count.py
 test_results.txt
 out.txt
+_test_search_result.txt
+roslyn_test.json
+
+# .NET Build Artifacts
+bin/
+obj/
 
 # IDEs and Editors
 .idea/
