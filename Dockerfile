@@ -7,16 +7,18 @@ COPY RoslynParser/ .
 # publish создаёт плоский каталог со всеми DLL-зависимостями Roslyn
 RUN dotnet publish -c Release -o /roslyn/out
 
-# ── Stage 2: Python runtime ────────────────────────────────────────────────
-FROM python:3.11-slim
+# ── Stage 2: финальный образ — SDK нужен RoslynParser (MSBuildLocator) ────────
+# Используем dotnet SDK как базу и доустанавливаем Python.
+# dotnet/runtime:8.0 НЕ подходит: MSBuildLocator ищет SDK при запуске и падает.
+FROM mcr.microsoft.com/dotnet/sdk:8.0
 
-# libicu-dev нужна для Roslyn (обработка Unicode в .NET)
-RUN apt-get update && apt-get install -y libicu-dev && rm -rf /var/lib/apt/lists/*
-
-# Копируем .NET runtime из официального образа (~180 MB) вместо wget-установки (~700 MB SDK)
-# Этот слой кешируется навсегда — не меняется при пересборке Python-части
-COPY --from=mcr.microsoft.com/dotnet/runtime:8.0 /usr/share/dotnet /usr/share/dotnet
-RUN ln -s /usr/share/dotnet/dotnet /usr/bin/dotnet
+# Устанавливаем Python 3.11 и libicu (нужна для Roslyn Unicode-обработки)
+RUN apt-get update && apt-get install -y \
+    python3.11 python3.11-venv python3-pip libicu-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
+    && ln -sf /usr/bin/pip3 /usr/bin/pip
 
 WORKDIR /app
 
@@ -25,10 +27,10 @@ COPY requirements.txt .
 
 # torch в отдельном RUN — инвалидируется только при смене версии torch,
 # а не при любом изменении requirements.txt
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+RUN pip install --no-cache-dir --break-system-packages torch --index-url https://download.pytorch.org/whl/cpu
 
 # Остальные зависимости — инвалидируются только при изменении requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
 
 # ── Код приложения ──────────────────────────────────────────────────────────
 # Копируется последним — изменение кода не инвалидирует кеш pip и dotnet
