@@ -458,8 +458,10 @@ class KnowledgeDB:
         
         # Санитизация запроса: удаляем кавычки и оборачиваем каждое слово,
         # чтобы FTS5 не падал на спецсимволах типа '.' или '-'
+        # OR вместо AND: FTS5 даёт максимальный recall, BM25 сам ранжирует по кол-ву совпадений.
+        # Жёсткий AND лишний: финальный приоритет определяет RRF через vector + graph каналы.
         safe_terms = [f'"{term}"' for term in query.replace('"', ' ').split() if term]
-        safe_query = ' '.join(safe_terms)
+        safe_query = ' OR '.join(safe_terms)
         if not safe_query:
             return []
 
