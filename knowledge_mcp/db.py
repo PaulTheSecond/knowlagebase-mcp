@@ -407,7 +407,7 @@ class KnowledgeDB:
         """Добавляет векторное представление в виртуальную vec0 таблицу."""
         cursor = self.conn.cursor()
         cursor.execute("""
-            INSERT INTO chunks_vec(rowid, embedding)
+            INSERT OR REPLACE INTO chunks_vec(rowid, embedding)
             VALUES (?, ?)
         """, (chunk_rowid, sqlite_vec.serialize_float32(vector)))
         self._auto_commit()
@@ -425,7 +425,7 @@ class KnowledgeDB:
         ]
         
         cursor.executemany("""
-            INSERT INTO chunks_vec(rowid, embedding)
+            INSERT OR REPLACE INTO chunks_vec(rowid, embedding)
             VALUES (?, ?)
         """, batch_data)
         self._auto_commit()

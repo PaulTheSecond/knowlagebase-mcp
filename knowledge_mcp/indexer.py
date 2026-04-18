@@ -376,6 +376,16 @@ class Indexer:
         if not chunks_to_embed:
             return
 
+        # Удаляем дубликаты по rowid (могут возникнуть при наложении новых чанков и recovery)
+        unique_list = []
+        seen_rowids = set()
+        for item in chunks_to_embed:
+            rowid = item[1]
+            if rowid not in seen_rowids:
+                unique_list.append(item)
+                seen_rowids.add(rowid)
+        
+        chunks_to_embed = unique_list
         total_chunks = len(chunks_to_embed)
         logger.info(f"Batch computing local embeddings for {total_chunks} chunks (sub-batches of {EMBED_SUB_BATCH_SIZE})...")
 
