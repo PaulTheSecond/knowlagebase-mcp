@@ -82,6 +82,13 @@ def main():
         # чтобы handshake проходил мгновенно и не блокировался загрузкой ML-модели.
         import asyncio
         from .server import start_mcp_server
+        
+        # Проверка: если БД не существует, MCP сервер может запуститься вхолостую
+        if not os.path.exists(args.db_path):
+            logger.error(f"Database file not found at {args.db_path}. Please check your volume mounts.")
+            # Мы не выходим с ошибкой, так как SQLite создаст пустую БД, 
+            # но мы хотя бы предупреждаем в stderr.
+            
         use_emb = getattr(args, 'with_embeddings', False)
         asyncio.run(start_mcp_server(args.db_path, enable_embeddings=use_emb))
     else:

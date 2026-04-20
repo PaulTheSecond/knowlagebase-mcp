@@ -60,7 +60,7 @@ A high-precision local knowledge base server (RAG) that implements the **Model C
      "mcpServers": {
        "knowledge-mcp": {
          "command": "docker",
-         "args": ["exec", "-i", "knowlagebase-mcp-knowledge-mcp-1", "python", "-m", "knowledge_mcp.main", "mcp"]
+         "args": ["exec", "-i", "knowledge-mcp", "python", "-m", "knowledge_mcp.main", "mcp"]
        }
      }
    }
