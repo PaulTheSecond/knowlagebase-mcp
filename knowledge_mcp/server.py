@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import contextlib
+import sys
 from typing import Any, Callable
 
 from mcp.server import Server
@@ -451,7 +453,10 @@ async def start_mcp_server(db_path: str, enable_embeddings: bool = True):
     """Инициализация БД и запуск MCP-сервера по STDIO (стандарт для локальных агентов)."""
     global db, use_embeddings
 
-    db = KnowledgeDB(db_path)
+    # Любой лишний stdout до MCP-кадров ломает handshake.
+    # На время инициализации принудительно уводим stdout в stderr.
+    with contextlib.redirect_stdout(sys.stderr):
+        db = KnowledgeDB(db_path)
     use_embeddings = enable_embeddings
     # Ленивая загрузка embedder = LocalEmbedder() перенесена внутрь _handle_search,
     # чтобы избежать 10-секундного таймаута при инициализации (handshake) протокола MCP.
