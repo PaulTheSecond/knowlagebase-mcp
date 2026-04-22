@@ -1,5 +1,6 @@
 # Knowledge MCP
 
+![Version v1.2](https://img.shields.io/badge/version-v1.2-blue.svg)
 A high-precision local knowledge base server (RAG) that implements the **Model Context Protocol (MCP)**. It enables AI agents (Codex, Claude Code, Gemini CLI, etc.) to navigate, search, and reason about complex codebases using a hybrid approach combining semantic, lexical, and structural analysis.
 
 ## 🚀 Key Features
@@ -68,6 +69,8 @@ A high-precision local knowledge base server (RAG) that implements the **Model C
 
 ## 📐 Architecture & Decisions
 
+- [Roadmap: Autonomous Sync & Webhooks](docs/roadmap_autonomous_sync.md)
+
 For deep dives into the technical design, see our Architecture Decision Records:
-- [ADR-001: Local MCP RAG Foundation](adr-001-local-mcp-rag-knowledge-base.md)
-- [ADR-002: Hybrid Semantic & Graph Indexing](adr-002-hybrid-semantic-graph-indexing.md)
+- [ADR-001: Local MCP RAG Foundation](docs/adr-001-local-mcp-rag-knowledge-base.md)
+- [ADR-002: Hybrid Semantic & Graph Indexing](docs/adr-002-hybrid-semantic-graph-indexing.md)
