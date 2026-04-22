@@ -1,60 +1,60 @@
-# ADR-002: Гибридное индексирование кодовой базы (Semantic + Graph + Roslyn)
+# ADR-002: Hybrid Codebase Indexing (Semantic + Graph + Roslyn)
 
-| Метаданные | Значение |
+| Metadata | Value |
 | :--- | :--- |
-| **Статус** | Принято |
-| **Дата** | 2026-04-16 |
-| **Автор** | Root |
-| **Затрагивает** | Indexer, Knowledge DB, Search Retrieval, RoslynParser |
-| **Breaking Change** | Да (требуется миграция БД и переиндексация) |
+| **Status** | Accepted |
+| **Date** | 2026-04-16 |
+| **Author** | Root |
+| **Affects** | Indexer, Knowledge DB, Search Retrieval, RoslynParser |
+| **Breaking Change** | Yes (requires DB migration and full re-indexing) |
 
 ---
 
-## Контекст
+## Context
 
-Обычного полнотекстового поиска (FTS) и простых векторных эмбеддингов недостаточно для качественного поиска по сложным кодовым базам (особенно .NET). Агентам требуется понимание структуры кода: не только что написано, но и как компоненты связаны между собой (кто кого вызывает, кто что наследует).
+Basic full-text search (FTS) and simple vector embeddings are insufficient for high-quality retrieval over complex codebases (especially .NET). Agents require an understanding of code structure — not just what is written, but how components relate to each other (who calls what, who inherits whom).
 
-Ранее (в ADR-001) была заложена основа для локального RAG. Данное решение расширяет её до полноценного гибридного подхода.
-
----
-
-## Проблема
-
-1. **Низкая точность простого Chunking:** Разбиение кода на чанки по количеству строк часто разрывает контекст функций и классов.
-2. **Отсутствие связей:** Векторный поиск находит "похожие" куски, но не может ответить на вопрос "где используется этот метод?" или "какая иерархия у этого класса?".
-3. **Особенности .NET:** Для C# требуется глубокий семантический анализ (Roslyn), так как именования и типы данных распределены по множеству файлов и проектов в рамках одного Solution.
-4. **Производительность:** Глубокий анализ замедляет индексацию. Нужна параллелизация и эффективное хранение графов.
+ADR-001 established the foundation for a local RAG system. This decision extends it to a full hybrid approach.
 
 ---
 
-## Решение
+## Problem
 
-Внедрить трехслойную систему индексирования и поиска (Hybrid Triple Search):
-
-### 1. Семантический уровень (Parsing)
-- **C# / .NET:** Использование `RoslynParser` (автономное консольное приложение на .NET 8), которое извлекает полное дерево символов, сигнатуры методов и типы. 
-- **TS/JS/другие:** Использование `Tree-sitter` через `CodeParser` для извлечения структурных чанков (функции, классы) вместо текстовых.
-- **Markdown:** Секционный парсинг (по заголовкам) для сохранения логической целостности документации.
-
-### 2. Графовый уровень (Symbol Graph)
-- В БД добавлены таблицы `symbols` и `symbol_edges`.
-- Извлекаются связи: `CALLS` (вызовы), `INHERITS` (наследование), `IMPLEMENTS` (реализация), `IMPORTS` (импорты).
-- Реализован механизм `unresolved_refs`: ссылки на символы, которые не найдены в текущем файле, сохраняются и разрешаются в конце процесса индексации по всей базе (cross-repo resolution).
-
-### 3. Инфраструктура и производительность
-- **Параллелизация:** Хэширование файлов и парсинг вынесены в `ThreadPoolExecutor`.
-- **Батч-векторизация:** Эмбеддинги считаются порциями (`sub-batches`) с контролем потребления RAM (важно для контейнеров с лимитом 2-4GB).
-- **Транзакционность:** Использование одной большой транзакции SQLite для записи результатов индексации репозитория.
-
-### 4. Ранжирование (RRF)
-При поиске результаты из трех каналов объединяются через **Reciprocal Rank Fusion**:
-- **FTS5:** Находит точные вхождения имен и терминов.
-- **Vector (KNN):** Находит семантически похожие концепции.
-- **Graph:** Дает буст (x2) тем чанкам, имена символов в которых точно совпадают с терминами запроса.
+1. **Low precision of naive chunking:** Splitting code into fixed-size line chunks often breaks the context of functions and classes.
+2. **No relational awareness:** Vector search finds "similar" fragments but cannot answer "where is this method used?" or "what is the inheritance hierarchy of this class?".
+3. **.NET specifics:** C# requires deep semantic analysis (Roslyn), because naming and type information is spread across many files and projects within a single Solution.
+4. **Performance:** Deep analysis slows down indexing. Parallelization and efficient graph storage are essential.
 
 ---
 
-## Архитектура
+## Decision
+
+Implement a three-layer indexing and search system (Hybrid Triple Search):
+
+### 1. Semantic Layer (Parsing)
+- **C# / .NET:** `RoslynParser` — a standalone .NET 8 console application that extracts the full symbol tree, method signatures, and type information.
+- **TS/JS/Other:** `Tree-sitter` via `CodeParser` to extract structural chunks (functions, classes) rather than raw text slices.
+- **Markdown:** Section-based parsing (by headings) to preserve the logical integrity of documentation.
+
+### 2. Graph Layer (Symbol Graph)
+- `symbols` and `symbol_edges` tables added to the database.
+- Extracted relationship types: `CALLS`, `INHERITS`, `IMPLEMENTS`, `IMPORTS`.
+- `unresolved_refs` mechanism: references to symbols not found in the current file are stored and resolved at the end of the indexing pass across the entire database (cross-repo resolution).
+
+### 3. Infrastructure & Performance
+- **Parallelization:** File hashing and parsing offloaded to a `ThreadPoolExecutor`.
+- **Batch vectorization:** Embeddings computed in sub-batches with RAM consumption control (critical for containers with 2–4 GB limits).
+- **Transactionality:** A single large SQLite transaction used to persist indexing results for a repository.
+
+### 4. Ranking (RRF)
+At search time, results from all three channels are merged via **Reciprocal Rank Fusion**:
+- **FTS5:** Finds exact name and term matches.
+- **Vector (KNN):** Finds semantically similar concepts.
+- **Graph:** Applies a ×2 relevance boost to chunks whose symbol names exactly match query terms.
+
+---
+
+## Architecture
 
 ```mermaid
 flowchart TD
@@ -92,18 +92,18 @@ flowchart TD
 
 ---
 
-## Статус
+## Status
 
-**Принято.** Реализовано в последних коммитах:
-- Переход на гибридный поиск (RRF).
-- Интеграция Roslyn для .NET.
-- Параллельная индексация.
-- Графовые инструменты MCP (`knowledge_get_callers`, `knowledge_impact_analysis` и др.).
+**Accepted.** Implemented in recent commits:
+- Transition to hybrid search (RRF).
+- Roslyn integration for .NET.
+- Parallel indexing.
+- Graph-based MCP tools (`knowledge_get_callers`, `knowledge_impact_analysis`, etc.).
 
 ---
 
-## Ссылки на изменения
+## References
 
-- [db.py](file:///c:/Repos/knowlagebase-mcp/knowledge_mcp/db.py) — реализация RRF и графовых запросов.
-- [indexer.py](file:///c:/Repos/knowlagebase-mcp/knowledge_mcp/indexer.py) — логика оркестрации парсеров и параллелизации.
-- [RoslynParser/](file:///c:/Repos/knowlagebase-mcp/RoslynParser/) — проект на C# для глубокого анализа.
+- [db.py](file:///c:/Repos/knowledgebase-mcp/knowledge_mcp/db.py) — RRF implementation and graph queries.
+- [indexer.py](file:///c:/Repos/knowledgebase-mcp/knowledge_mcp/indexer.py) — Parser orchestration and parallelization logic.
+- [RoslynParser/](file:///c:/Repos/knowledgebase-mcp/RoslynParser/) — C# project for deep semantic analysis.

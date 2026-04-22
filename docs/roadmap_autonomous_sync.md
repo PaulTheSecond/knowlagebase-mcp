@@ -1,64 +1,65 @@
-# Дорожная карта (Roadmap): Автономная работа и подписка на триггеры
+# Roadmap: Autonomous Operation & Trigger Subscriptions
 
-В этом документе описан план будущих доработок для перевода MCP-сервера базы знаний в автономный режим работы. Основная цель — настроить автоматическое реагирование на изменения в подключенных репозиториях.
-Текущая версия продукта: **v1.2**
+This document outlines the planned evolution of the knowledge base MCP server toward fully autonomous operation — automatically reacting to changes in connected repositories.
+
+Current version: **v1.2**
 
 ---
 
-## Визуализация дорожной карты
+## Roadmap Visualization
 
 ```mermaid
 timeline
-    title Эволюция проекта
-    v0.9 : Ранние версии
-         : Базовый полнотекстовый поиск (FTS)
-         : Отсутствие графа зависимостей
-    v1.2 : Текущая стабильная версия
-         : Гибридный поиск и Graph-индексация
-    v1.3 : Базовая архитектура (Env/Config)
-         : Управление источниками через файлы
-         : Интеграция SSH / PAT (v1.3.1)
-    v1.4 : Триггеры и Webhooks
-         : HTTP-endpoints для Git-серверов
-         : Валидация подписей (HMAC)
-    v1.5 : Автономный жизненный цикл
-         : Фоновая Delta-синхронизация
-         : Обновление графа и векторов на лету
-    v1.6 : Панель управления (Web UI)
-         : Visual Dashboard на отдельном порту
-         : Простое управление подписками и статусом
+    title Project Evolution
+    v0.9 : Early Versions
+         : Basic full-text search (FTS)
+         : No dependency graph
+    v1.2 : Current Stable Release
+         : Hybrid search & Graph indexing
+    v1.3 : Base Configuration (Env/Config)
+         : Source management via config files
+         : SSH / PAT integration (v1.3.1)
+    v1.4 : Triggers & Webhooks
+         : HTTP endpoints for Git servers
+         : Signature validation (HMAC)
+    v1.5 : Autonomous Lifecycle
+         : Background delta-synchronization
+         : Live graph and vector updates
+    v1.6 : Management Dashboard (Web UI)
+         : Visual dashboard on a dedicated port
+         : Simple subscription and status management
 ```
 
 ---
 
-## v1.3: Базовая конфигурация (Env / Файл настроек)
-*Оценка: Минорное обновление (базовый парсинг настроек)*
-- Настройка первичной конфигурации подписок и триггеров через переменные окружения (`.env`) или файл конфигурации (`config.yaml` / `settings.json`).
-- Это позволит настроить автономную работу сразу при запуске контейнера, без обязательного использования визуальных интерфейсов.
+## v1.3: Base Configuration (Env / Config File)
+*Estimate: Minor update (basic settings parsing)*
+- Configure subscriptions and triggers via environment variables (`.env`) or a config file (`config.yaml` / `settings.json`).
+- Enables autonomous operation at container startup without requiring any visual interface.
 
-## v1.3.1: Источники обновления (Sources)
-*Оценка: Патч (расширение возможностей конфигурации из v1.3)*
-- Определение параметров для различных источников (в первую очередь, Git-репозиториев) в конфигурации.
-- Управление учетными данными для безопасного доступа к закрытым репозиториям:
-  - Поддержка аутентификации через SSH-ключи.
-  - Аутентификация через Personal Access Tokens (PAT).
+## v1.3.1: Update Sources
+*Estimate: Patch (extends v1.3 config capabilities)*
+- Define source parameters for various origins (primarily Git repositories) in the configuration.
+- Manage credentials for secure access to private repositories:
+  - SSH key authentication.
+  - Personal Access Token (PAT) authentication.
 
-## v1.4: Настройка триггеров (Triggers)
-*Оценка: Минорное обновление (добавление новых HTTP-эндпоинтов и логики)*
-- Определение и гибкий выбор событий, инициирующих автоматическое обновление базы знаний:
-  - `Push` (пакет коммитов) в целевую ветку (например, `master` или `main`).
-  - Успешное выполнение `Merge Request` / `Pull Request`.
-  - Периодическое обновление по заданному расписанию (Cron).
-- Реализация механизмов аутентификации для входящих вебхуков (Webhooks) от Git-серверов:
-  - Валидация криптографических подписей (например, через Shared Secrets / HMAC), выставляемых GitHub/GitLab, чтобы система доверяла источнику сигнала.
+## v1.4: Trigger Configuration
+*Estimate: Minor update (new HTTP endpoints and business logic)*
+- Define and flexibly select events that trigger automatic knowledge base updates:
+  - `Push` (batch of commits) to a target branch (e.g., `master` or `main`).
+  - Successful `Merge Request` / `Pull Request` completion.
+  - Periodic scheduled updates (Cron).
+- Implement authentication mechanisms for incoming webhooks from Git servers:
+  - Cryptographic signature validation (e.g., via Shared Secrets / HMAC) as used by GitHub/GitLab, so the system can trust the signal source.
 
-## v1.5: Жизненный цикл обработки (Integration Flow)
-*Оценка: Минорное обновление (системная интеграция и оптимизация)*
-- Маршрутизация: привязка системных триггеров к существующим внутренним бизнес-процессам (фоновая синхронизация репозиториев, частичная индексация только измененных файлов, удаление устаревших данных).
-- Парсинг полезной нагрузки: извлечение релевантных путей файлов из полезной нагрузки вебхука (payload) и передача их компоненту `Indexer` для оптимизации вычислений (Delta-sync).
+## v1.5: Processing Lifecycle (Integration Flow)
+*Estimate: Minor update (system integration and optimization)*
+- Routing: bind system triggers to existing internal processes (background repository sync, partial re-indexing of changed files only, removal of stale data).
+- Payload parsing: extract relevant file paths from the webhook payload and pass them to the `Indexer` component for optimized delta-sync.
 
-## v1.6: Веб-интерфейс настройки (Web UI)
-*Оценка: Минорное обновление (крупная автономная фича)*
-- Внедрение веб-интерфейса в самую последнюю очередь как надстройки над конфигурацией.
-- Запуск легковесного визуального UI на отдельном порту (например, `8080`), но в рамках **того же контейнера**, что и MCP сервер.
-- Внедрение простой системы авторизации для ограничения доступа к панели настроек и визуального управления подписками.
+## v1.6: Web Configuration Dashboard (Web UI)
+*Estimate: Minor update (major standalone feature)*
+- Introduce a web interface as the last layer on top of the existing configuration.
+- Launch a lightweight visual UI on a dedicated port (e.g., `8080`) but **within the same container** as the MCP server.
+- Implement simple authorization to restrict access to the settings panel and visual subscription management.

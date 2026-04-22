@@ -1,6 +1,7 @@
 # Knowledge MCP
 
 ![Version v1.2](https://img.shields.io/badge/version-v1.2-blue.svg)
+
 A high-precision local knowledge base server (RAG) that implements the **Model Context Protocol (MCP)**. It enables AI agents (Codex, Claude Code, Gemini CLI, etc.) to navigate, search, and reason about complex codebases using a hybrid approach combining semantic, lexical, and structural analysis.
 
 ## 🚀 Key Features
@@ -41,31 +42,93 @@ A high-precision local knowledge base server (RAG) that implements the **Model C
 
 ## 🐳 Quick Start (Docker)
 
-1. **Build and start the services:**
-   ```bash
-   docker compose up -d
-   ```
+### 1. Configure your repository path
 
-2. **Index your project:**
-   Point the indexer to a local repository (mounted or absolute path):
-   ```bash
-   curl -X POST http://localhost:8000/sync \
-        -H "Content-Type: application/json" \
-        -d '{"repo_id": "my-app", "repo_path": "/repos/my-app"}'
-   ```
+Create a `.env` file in the project root:
+```env
+# The host directory that will be mounted as /repos inside the container.
+# Set this to the PARENT folder of your repositories.
+REPOS_DIR=C:\Repos
+```
 
-3. **Connect your MCP Client:**
-   Add this to your AI client's config (e.g., `mcp.json`):
-   ```json
-   {
-     "mcpServers": {
-       "knowledge-mcp": {
-         "command": "docker",
-         "args": ["exec", "-i", "knowledge-mcp", "python", "-m", "knowledge_mcp.main", "mcp"]
-       }
-     }
-   }
-   ```
+### 2. Build and start the container
+```bash
+docker compose up -d
+```
+
+### 3. Index a specific project
+
+**Option A — PowerShell script** (recommended, see [Scripts](#-scripts)):
+```powershell
+.\scripts\Reindex-Repo.ps1 -Wait
+```
+
+**Option B — direct HTTP call:**
+```bash
+curl -X POST http://localhost:8000/sync \
+     -H "Content-Type: application/json" \
+     -d '{"repo_id": "my-app", "repo_path": "/repos/my-app"}'
+```
+
+> ⚠️ `repo_path` is the path **inside the container** (e.g., `/repos/my-app`), not the host path.
+
+### 4. Connect your MCP Client
+
+Add this to your AI client's config (e.g., `mcp.json`):
+```json
+{
+  "mcpServers": {
+    "knowledge-mcp": {
+      "command": "docker",
+      "args": ["exec", "-i", "knowledge-mcp", "python", "-m", "knowledge_mcp.main", "mcp"]
+    }
+  }
+}
+```
+
+---
+
+## 🔧 Scripts
+
+### `scripts/Reindex-Repo.ps1`
+
+A PowerShell helper script that triggers re-indexing of a repository by sending a POST request to the running `knowledge-mcp` server.
+
+**Parameters:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `-RepoId` | `ImpactOS.Core.Lib` | Unique repository identifier used as a key in the database |
+| `-RepoPath` | `/repos/ImpactOS.Core.Lib` | Path to the repository **inside the Docker container** |
+| `-ServerUrl` | `http://localhost:8000` | URL of the running knowledge-mcp server |
+| `-Wait` | `$false` | If set, streams container logs after triggering sync |
+
+**Usage examples:**
+
+```powershell
+# Trigger re-indexing with default settings (ImpactOS.Core.Lib)
+.\scripts\Reindex-Repo.ps1
+
+# Trigger and watch progress in real time
+.\scripts\Reindex-Repo.ps1 -Wait
+
+# Index a different repository
+.\scripts\Reindex-Repo.ps1 -RepoId "MyOtherLib" -RepoPath "/repos/MyOtherLib"
+
+# Point to a remote server
+.\scripts\Reindex-Repo.ps1 -ServerUrl "http://192.168.1.100:8000" -Wait
+```
+
+**How it works:**
+1. Verifies the server is reachable at `ServerUrl`.
+2. Sends a `POST /sync` request with `repo_id` and `repo_path`.
+3. Indexing runs in the background inside the container.
+4. With `-Wait`, streams live logs via `docker logs -f`.
+
+> 💡 **Path mapping:** If `REPOS_DIR=C:\Repos`, then `C:\Repos\MyLib` on the host
+> is accessible inside the container as `/repos/MyLib`.
+
+---
 
 ## 📐 Architecture & Decisions
 

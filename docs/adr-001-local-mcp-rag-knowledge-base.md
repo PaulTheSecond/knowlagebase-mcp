@@ -1,136 +1,132 @@
-# ADR-001: Локальная межрепозиторная база знаний (RAG) через MCP для Codex
+# ADR-001: Local Cross-Repository Knowledge Base (RAG) via MCP
 
-| Метаданные | Значение |
+| Metadata | Value |
 | :--- | :--- |
-| **Статус** | Предложено |
-| **Дата** | 2026-03-19 |
-| **Автор** | Root |
-| **Затрагивает** | Developer Tooling, Codex CLI, MCP, локальная база знаний |
-| **Breaking Change** | Нет |
+| **Status** | Proposed |
+| **Date** | 2026-03-19 |
+| **Author** | Root |
+| **Affects** | Developer Tooling, Codex CLI, MCP, Local Knowledge Base |
+| **Breaking Change** | No |
 
 ---
 
-## Контекст
+## Context
 
-Нужно обеспечить "память" и поиск по знаниям **между репозиториями** для ИИ-ассистента (Codex), сохраняя базу знаний **локально** (без отправки содержимого репо во внешние сервисы).
+The goal is to provide **cross-repository memory and knowledge retrieval** for an AI assistant (Codex), while keeping the knowledge base **entirely local** (no codebase content sent to external services).
 
-Цель: построить базу знаний, удобочитаемую и удобоиспользуемую **нейросетевыми агентами** (RAG retrieval + ссылки на источники).
+Objective: build a knowledge base that is readable and usable by **AI agents** (RAG retrieval + source citations).
 
-Ключевой принцип для этой задачи:
-- **Source of truth = кодовая база.** Новая KB строится по исходникам (парсинг/анализ кода), а не по существующему vault/документации.
-- `docs/` и `knowledge/` можно просматривать/индексировать только как *неавторитетные* подсказки (например, для поиска мест в коде, терминологии, примеров), потому что документация может отставать и быть неверной по отношению к коду.
+Key principle:
+- **Source of truth = the codebase.** The new KB is built from source code (parsing/analysis), not from existing vaults or documentation.
+- `docs/` and `knowledge/` directories may be scanned and indexed only as *non-authoritative hints* (e.g., to locate code, terminology, examples), because documentation can lag behind and be incorrect relative to the code.
 
-Источники в этом репозитории (пример), с разным уровнем доверия:
-- **Авторитетные (обязательные):** исходники в `C:\Repos\Yurta.Core.Lib\` (`*.cs`, `*.csproj`, `*.sln`, `*.props`, и т.п.)
-- **Неавторитетные (опциональные):** `C:\Repos\Yurta.Core.Lib\docs\`, `C:\Repos\Yurta.Core.Lib\knowledge\`
+Trust levels for sources in this repository:
+- **Authoritative (required):** source files in `C:\Repos\Yurta.Core.Lib\` (`*.cs`, `*.csproj`, `*.sln`, `*.props`, etc.)
+- **Non-authoritative (optional):** `C:\Repos\Yurta.Core.Lib\docs\`, `C:\Repos\Yurta.Core.Lib\knowledge\`
 
-Дополнительный контекст:
-- В репозитории присутствует маркер `C:\Repos\Yurta.Core.Lib\.arscontexta`, который обозначает vault Ars Contexta. В текущем состоянии vault-хуки отключены (`git: false`, `session_capture: false`), но корпус знаний в `C:\Repos\Yurta.Core.Lib\knowledge\` используется как входной материал.
-- В проекте одновременно используются две версии BMad: legacy-конфиг `C:\Repos\Yurta.Core.Lib\.bmad-core\core-config.yaml` и текущий конфиг `C:\Repos\Yurta.Core.Lib\_bmad\core\config.yaml`. В текущей версии BMad `project_knowledge` должен указывать на локальную knowledge base (например, `{project-root}/knowledge`) для grounding.
-- Codex не исполняет Claude-style slash-команды вида `/arscontexta:*`; вместо этого доступ к памяти должен быть реализован как MCP-инструменты.
-  - Для этого репозитория целевой абсолютный путь knowledge base: `C:\Repos\Yurta.Core.Lib\knowledge` (в конфиге допускается плейсхолдер `{project-root}`).
+Additional context:
+- The repository contains a `C:\Repos\Yurta.Core.Lib\.arscontexta` marker identifying an Ars Contexta vault. Vault hooks are currently disabled (`git: false`, `session_capture: false`), but the knowledge corpus in `C:\Repos\Yurta.Core.Lib\knowledge\` is used as input material.
+- The project uses two BMad versions simultaneously: a legacy config at `C:\Repos\Yurta.Core.Lib\.bmad-core\core-config.yaml` and the current config at `C:\Repos\Yurta.Core.Lib\_bmad\core\config.yaml`. In the current BMad version, `project_knowledge` should point to the local knowledge base (e.g., `{project-root}/knowledge`) for grounding.
+- Codex does not execute Claude-style slash commands like `/arscontexta:*`; memory access must instead be implemented as MCP tools.
 
-Требуется единый локальный сервис, который:
-1. Сканирует и индексирует множество репозиториев.
-2. Предоставляет retrieval API для RAG (достать релевантные фрагменты с метаданными и ссылками на источник).
-3. Подключается к Codex как MCP server.
-
----
-
-## Проблема
-
-1. **Нет межрепозиторной памяти для Codex "из коробки".** Сессии и контекст не формируют единую долговременную базу знаний по всем репо.
-2. **Нельзя отдавать базу знаний наружу.** Нужен офлайн/локальный режим, допустим Docker на локальной машине.
-3. **Нужны гарантии трассируемости.** Любой retrieved контент должен быть связан с источником: `repo`, `path`, позиция (строки/диапазон), `commit`/`sha` (если доступно).
-4. **RAG должен быть практичным, не академическим.** Реальные ответы должны опираться на быстрый поиск + векторный retrieval (hybrid), но система обязана иметь деградацию до текстового поиска, если embedding недоступен.
-5. **Документация может быть неверной.** Нельзя считать `docs/` и `knowledge/` истиной; retrieved-фрагменты из документации должны помечаться как "требует верификации" и не должны попадать в KB как проверенный факт без подтверждения кодом.
+A unified local service is required that:
+1. Scans and indexes multiple repositories.
+2. Provides a retrieval API for RAG (returning relevant chunks with metadata and source references).
+3. Connects to Codex as an MCP server.
 
 ---
 
-## Решение
+## Problem
 
-Сделать отдельный репозиторий с микроприложением (далее `knowledge-mcp`), которое поднимается локально (в Docker) и включает:
+1. **No cross-repository memory for Codex out of the box.** Sessions and context do not form a unified long-term knowledge base across repositories.
+2. **The knowledge base must not leave the machine.** An offline/local mode is required — e.g., Docker on a local workstation.
+3. **Traceability guarantees are required.** Any retrieved content must be linked to its source: `repo`, `path`, position (lines/range), `commit`/`sha` (where available).
+4. **RAG must be practical, not academic.** Real responses should rely on fast search + vector retrieval (hybrid), but the system must gracefully degrade to text-only search when embeddings are unavailable.
+5. **Documentation can be incorrect.** `docs/` and `knowledge/` must not be treated as ground truth; retrieved fragments from documentation must be marked as "requires verification" and must not enter the KB as verified facts without code confirmation.
 
-1. **Indexer (CLI/Job):**
-   - Сканирует репозиторий с приоритетом кода (allowlist типов файлов).
-   - Извлекает знания из кода:
-     - лексический/синтаксический анализ (минимум: функции/классы/интерфейсы/атрибуты/DI extensions/Options)
-     - извлечение ссылок между сущностями (symbol graph)
-     - построение "fact records" (агентный формат), где каждый факт имеет доказательство в коде (references)
-   - Нормализует найденное в "чанки" (chunking) в формате, удобном для агентного retrieval.
-   - Генерирует метаданные (repo_id, path, language, hash/mtime, git sha, tags).
-   - Считает embedding (опционально) через локальный провайдер.
-   - Пишет данные в локальную БД.
-   - Опционально: сканирует `docs/` и `knowledge/` как "подсказки", но сохраняет их отдельно от подтверждённых фактов из кода и с пониженным trust level.
+---
 
-2. **Store (локальная БД):**
-   - По умолчанию: SQLite (простота, переносимость, volume).
-   - Поддержка:
-     - полнотекстового поиска (FTS)
-     - хранения чанков и метаданных
-     - хранения векторов (если выбран vector backend) либо через отдельную БД/движок.
+## Decision
 
-3. **MCP Server (HTTP):**
-   - Экспортирует инструменты для Codex:
+Create a dedicated repository with a micro-application (`knowledge-mcp`) that runs locally (in Docker) and includes:
+
+1. **Indexer (CLI / Job):**
+   - Scans a repository with code-first priority (allowlist of file types).
+   - Extracts knowledge from code:
+     - Lexical/syntactic analysis (minimum: functions, classes, interfaces, attributes, DI extensions, Options)
+     - Cross-entity reference extraction (symbol graph)
+     - Builds "fact records" (agent-friendly format), where each fact has a code-backed proof (references)
+   - Normalizes findings into chunks in a format optimized for agentic retrieval.
+   - Generates metadata: `repo_id`, `path`, `language`, `hash`/`mtime`, `git sha`, `tags`.
+   - Computes embeddings (optional) via a local provider.
+   - Writes data to a local database.
+   - Optionally: scans `docs/` and `knowledge/` as hints, but stores them separately from verified code facts with a reduced trust level.
+
+2. **Store (Local Database):**
+   - Default: SQLite (simplicity, portability, volume-friendly).
+   - Supports:
+     - Full-text search (FTS)
+     - Chunk and metadata storage
+     - Vector storage (if a vector backend is selected) either via a separate DB/engine or within SQLite.
+
+3. **MCP Server:**
+   - Exposes tools to Codex:
      - `knowledge.search(query, repo?, path_glob?, tags?, top_k?)`
      - `knowledge.get_chunk(id)` / `knowledge.get_document(path, repo)`
-     - `knowledge.upsert_note(...)` (опционально: человеческие заметки поверх индексируемых фактов)
-   - Возвращает результаты с обязательными полями источника (repo/path/line_start/line_end/sha).
-   - Возвращает и поля доверия:
+     - `knowledge.upsert_note(...)` (optional: human annotations on top of indexed facts)
+   - Returns results with mandatory source fields (`repo`/`path`/`line_start`/`line_end`/`sha`).
+   - Returns trust fields:
      - `source_kind`: `code` | `docs` | `knowledge`
-     - `trust`: `verified` (код) | `hint` (документация)
+     - `trust`: `verified` (code) | `hint` (documentation)
 
-4. **Docker-first развёртывание:**
-   - `docker compose up -d` поднимает сервис на `127.0.0.1:<port>`.
-   - Данные хранятся в docker volume/локальной папке.
-   - Сервис не требует внешней сети для работы (кроме необязательной первоначальной установки моделей).
+4. **Docker-first deployment:**
+   - `docker compose up -d` starts the service on `127.0.0.1:<port>`.
+   - Data is stored in a Docker volume / local directory.
+   - The service requires no external network to operate (except optional initial model download).
 
-5. **Конфигурация мульти-репо (обязательно):**
-   - Явный список корней репозиториев (локальные пути) + `repo_id`.
-   - Монтирование репозиториев в контейнер как read-only volume (или запуск indexer на host), чтобы не требовать копирования исходников.
-   - Инкрементальная индексация по `repo_id` (частичный reindex выбранного репо).
-
----
-
-## Варианты (и почему нет)
-
-### Вариант A: Хостить удалённо (облачная БД + API)
-
-Отклонено: противоречит требованию "не отдавать базу знаний наружу".
-
-### Вариант B: Только полнотекстовый поиск (без embedding)
-
-Недостаточно для кода и концептуальных запросов: BM25/FTS часто проигрывает по recall там, где важна семантика.
-Допустимо как fallback при отсутствии embedding.
-
-### Вариант C: Использовать существующий vault (Obsidian/Ars Contexta) без MCP
-
-Недостаточно: нет стандартизированного retrieval API для подключения к Codex как инструментов, и нет автоматической индексации исходников/мульти-репо.
+5. **Multi-repo configuration (required):**
+   - Explicit list of repository roots (local paths) + `repo_id`.
+   - Mount repositories into the container as read-only volumes (or run the indexer on the host) to avoid copying source files.
+   - Incremental indexing per `repo_id` (partial re-index of a selected repository).
 
 ---
 
-## Сопоставление с текущими практиками
+## Alternatives Considered (and Rejected)
 
-1. `C:\Repos\Yurta.Core.Lib\knowledge\` и `C:\Repos\Yurta.Core.Lib\docs\` полезны как ориентиры, но не считаются истиной. Новая KB должна строиться по коду, а документы использоваться только как `hint`.
-2. BMad-workflow используют `project_knowledge` для grounding. В рамках этого ADR это не источник истины, а источник контекстных подсказок. Истина проверяется по коду.
-3. `knowledge-mcp` строит машиночитаемую KB поверх множества репо и хранит строгую provenance: что извлечено из кода, а что является подсказкой из документации.
+### Option A: Remote hosting (cloud DB + API)
+Rejected: contradicts the "no data leaving the machine" requirement.
+
+### Option B: Full-text search only (no embeddings)
+Insufficient for code and conceptual queries: BM25/FTS frequently underperforms on recall for semantics-heavy questions.
+Acceptable as a fallback when embeddings are unavailable.
+
+### Option C: Use an existing vault (Obsidian/Ars Contexta) without MCP
+Insufficient: no standardized retrieval API for connecting to Codex as tools, and no automatic source code indexing or multi-repo support.
 
 ---
 
-## Архитектура (в общих чертах)
+## Alignment with Current Practices
+
+1. `C:\Repos\Yurta.Core.Lib\knowledge\` and `C:\Repos\Yurta.Core.Lib\docs\` are useful as orientation, but are not treated as ground truth. The new KB is built from code; documents are used only as `hint`.
+2. BMad workflows use `project_knowledge` for grounding. Within this ADR it is a source of contextual hints, not truth. Truth is verified against code.
+3. `knowledge-mcp` builds a machine-readable KB on top of multiple repos and maintains strict provenance: what was extracted from code vs. what is a hint from documentation.
+
+---
+
+## High-Level Architecture
 
 ```mermaid
 flowchart LR
-  subgraph Repos["Множество репозиториев (read-only)"]
+  subgraph Repos["Multiple Repositories (read-only)"]
     R1["repo A"]
     R2["repo B"]
     R3["repo C"]
   end
 
-  subgraph KMCP["knowledge-mcp (локально)"]
+  subgraph KMCP["knowledge-mcp (local)"]
     IDX["Indexer (scan/chunk/embed)"]
     DB["Local DB (chunks + metadata + vectors)"]
-    API["MCP Server (HTTP)"]
+    API["MCP Server"]
   end
 
   Codex["Codex CLI"] -->|MCP tools| API
@@ -143,111 +139,111 @@ flowchart LR
 
 ---
 
-## Требования (для внешнего ассистента)
+## Requirements
 
-### Функциональные
+### Functional
 
-1. Индексация нескольких репозиториев с явным `repo_id`.
-2. Chunking для:
-   - Markdown (по заголовкам/секции)
-   - исходников (по размеру + эвристике границ, минимум по строкам)
+1. Index multiple repositories with an explicit `repo_id`.
+2. Chunking for:
+   - Markdown (by headings/sections)
+   - Source files (by size + boundary heuristics, minimum by line count)
 3. Hybrid retrieval:
-   - text search (FTS/BM25)
-   - vector search (embedding)
-   - объединение результатов (например, reciprocal rank fusion)
-4. Возврат источников:
+   - Text search (FTS/BM25)
+   - Vector search (embeddings)
+   - Result fusion (e.g., Reciprocal Rank Fusion)
+4. Source fields in all results:
    - `repo_id`, `path`, `line_start`, `line_end`
-   - `content` (фрагмент)
-   - `sha` (если репо git и sha доступен)
-5. Конфигурация ignore/allow:
+   - `content` (fragment)
+   - `sha` (if the repo is a git repo and sha is available)
+5. Ignore/allow configuration:
    - `.git/`, `bin/`, `obj/`, `.idea/`, `.vs/`, `node_modules/`
-   - исключение секретов: `*.pfx`, `*.pem`, `*.key`, `appsettings.*.json` (по списку)
-6. Источники по умолчанию (важно):
-   - Исходники индексируются всегда и имеют `source_kind=code`.
-   - `docs/**` и `knowledge/**` по умолчанию:
-     - либо полностью исключены из индекса,
-     - либо индексируются в отдельную коллекцию `hints` с `trust=hint` (не смешивать с `verified`).
-7. Выходной формат KB (для агентов):
-   - База знаний хранится как структура данных для retrieval (chunks + metadata + optional vectors).
-   - Опционально: экспорт/дамп в `jsonl` для автономных офлайн-агентов (без требований к человеческой навигации).
-8. Доказательность фактов:
-   - Любой факт с `trust=verified` должен иметь хотя бы одну ссылку на код (`repo_id`, `path`, `line_start`, `line_end`, `sha`).
-   - Факты без ссылок допускаются только как `trust=hint` (например, из документации/README), и должны маркироваться как "требует проверки".
+   - Secret exclusions: `*.pfx`, `*.pem`, `*.key`, `appsettings.*.json` (via denylist)
+6. Default source handling (important):
+   - Source files are always indexed with `source_kind=code`.
+   - `docs/**` and `knowledge/**` by default:
+     - Either fully excluded from the index,
+     - Or indexed into a separate `hints` collection with `trust=hint` (never mixed with `verified`).
+7. KB output format (for agents):
+   - Stored as a retrieval-optimized data structure (chunks + metadata + optional vectors).
+   - Optionally: export/dump to `jsonl` for autonomous offline agents.
+8. Fact provenance:
+   - Any fact with `trust=verified` must have at least one code reference (`repo_id`, `path`, `line_start`, `line_end`, `sha`).
+   - Facts without references are allowed only as `trust=hint` (e.g., from documentation/README) and must be marked as "requires verification".
 
-### Нефункциональные
+### Non-Functional
 
-1. Локальность данных: сервис не отправляет индексируемый контент наружу.
-2. Быстрый инкрементальный reindex:
-   - пропуск неизменённых файлов по `mtime + size` и/или по `hash`
-3. Наблюдаемость:
-   - логи индексации (сколько файлов/чанков, ошибки парсинга)
-4. Простота развёртывания:
-   - Docker Compose, один командный путь запуска
+1. Data locality: the service does not send indexed content outside the machine.
+2. Fast incremental re-indexing:
+   - Skip unchanged files via `mtime + size` and/or `hash`
+3. Observability:
+   - Indexing logs (file/chunk counts, parse errors)
+4. Simple deployment:
+   - Docker Compose, single command to start
 
 ---
 
-## Предложение по реализации (референс)
+## Reference Implementation (Guidance)
 
-Это не жёсткое требование, но ориентир для внешнего ассистента:
+Not a strict requirement, but a reference point for implementation:
 
-1. Язык: Python или Go (быстрый time-to-delivery).
-2. Хранилище:
-   - SQLite + FTS как baseline.
-   - Вектора:
-     - отдельный backend (например, Qdrant в Docker) либо
-     - хранение в SQLite, если выбран простой подход (с учётом размеров).
-3. Embedding провайдеры (плагин):
+1. Language: Python or Go (fast time-to-delivery).
+2. Storage:
+   - SQLite + FTS as the baseline.
+   - Vectors:
+     - Separate backend (e.g., Qdrant in Docker), or
+     - Stored in SQLite for a simpler approach (considering size constraints).
+3. Embedding providers (plugin):
    - `none` (FTS-only)
-   - `ollama` (локально; модель поднимается в Docker отдельно)
-   - `openai` (строго опционально, выключено по умолчанию)
+   - `ollama` (local; model runs in a separate Docker container)
+   - `openai` (strictly optional, disabled by default)
 
 ---
 
-## Интеграция с Codex
+## Codex Integration
 
-Codex подключается к MCP server локально.
+Codex connects to the MCP server locally.
 
-Ожидаемый UX:
-1. Поднять сервис: `docker compose up -d`
-2. Добавить MCP server в Codex CLI (или в `~/.codex/config.toml`).
-3. В диалоге просить ассистента использовать инструменты `knowledge.search`/`knowledge.get_chunk` перед ответом.
-
----
-
-## План реализации (Definition of Done для внешнего ассистента)
-
-1. Репозиторий `knowledge-mcp` с `docker-compose.yml`, который поднимает MCP server и локальную БД (volume).
-2. CLI-команда индексации (или фоновой job), принимающая конфиг списка репозиториев.
-3. Рабочие MCP tools: `knowledge.search` и `knowledge.get_chunk` (минимум).
-4. Инкрементальная индексация и базовые метрики/логи.
-5. Документация по подключению к Codex и по локальной модели embeddings (опционально).
+Expected UX:
+1. Start the service: `docker compose up -d`
+2. Add the MCP server to Codex CLI (or `~/.codex/config.toml`).
+3. In the conversation, ask the assistant to use `knowledge.search`/`knowledge.get_chunk` tools before answering.
 
 ---
 
-## Ссылки на документы (абсолютные пути, текущий репозиторий)
+## Definition of Done
 
-Это документы/файлы, упомянутые в контексте и требованиях ADR:
-- `C:\Repos\Yurta.Core.Lib\docs\` (проектная документация; индексируется как входной корпус)
-- `C:\Repos\Yurta.Core.Lib\knowledge\` (корпус знаний; индексируется как входной корпус)
-- `C:\Repos\Yurta.Core.Lib\.arscontexta` (маркер vault Ars Contexta + локальная конфигурация)
-- `C:\Repos\Yurta.Core.Lib\.bmad-core\core-config.yaml` (legacy BMad core config, multi-library контекст)
-- `C:\Repos\Yurta.Core.Lib\_bmad\core\config.yaml` (текущий BMad core config, включая `project_knowledge`)
-- `C:\Repos\Yurta.Core.Lib\knowledge\guides\index.md` (точка входа существующего корпуса знаний; индексируется как входной корпус)
+1. `knowledge-mcp` repository with a `docker-compose.yml` that starts the MCP server and local DB (volume).
+2. CLI indexing command (or background job) accepting a list of repository configs.
+3. Working MCP tools: `knowledge.search` and `knowledge.get_chunk` (minimum).
+4. Incremental indexing and basic metrics/logs.
+5. Documentation on connecting to Codex and on the local embeddings model (optional).
 
 ---
 
-## Риски
+## Referenced Files
 
-| Риск | Вероятность | Митигация |
-|------|-------------|-----------|
-| Большой объём данных, индекс разрастается | Средняя | инкрементальная индексация, TTL для transient-чанков, лимиты по типам файлов |
-| Утечки секретов через индекс | Средняя | жёсткий denylist расширений и путей, опционально regex-маскирование |
-| Низкое качество retrieval без embeddings | Высокая (если embeddings выключены) | hybrid подход + возможность локального embedding через Ollama |
-| Зависимость от docker/runtime у пользователя | Низкая | предоставить и docker-way, и native запуск (опционально) |
-| Документация вводит в заблуждение | Средняя | разделение `verified` vs `hint`, приоритет кода, provenance + ссылки на код |
+Documents and files referenced in the ADR context:
+- `C:\Repos\Yurta.Core.Lib\docs\` (project documentation; indexed as input corpus)
+- `C:\Repos\Yurta.Core.Lib\knowledge\` (knowledge corpus; indexed as input corpus)
+- `C:\Repos\Yurta.Core.Lib\.arscontexta` (Ars Contexta vault marker + local config)
+- `C:\Repos\Yurta.Core.Lib\.bmad-core\core-config.yaml` (legacy BMad core config, multi-library context)
+- `C:\Repos\Yurta.Core.Lib\_bmad\core\config.yaml` (current BMad core config, including `project_knowledge`)
+- `C:\Repos\Yurta.Core.Lib\knowledge\guides\index.md` (entry point of the existing knowledge corpus)
 
 ---
 
-## Статус
+## Risks
 
-**Предложено.** Следующий шаг: завести отдельный репозиторий `knowledge-mcp` и реализовать baseline (FTS + MCP tools), затем расширить до hybrid retrieval с локальными embeddings.
+| Risk | Likelihood | Mitigation |
+|------|------------|------------|
+| Large data volume, index grows unbounded | Medium | Incremental indexing, TTL for transient chunks, file type limits |
+| Secret leakage through the index | Medium | Strict extension and path denylist, optional regex masking |
+| Poor retrieval quality without embeddings | High (if disabled) | Hybrid approach + local embedding via Ollama as fallback |
+| Docker/runtime dependency on user's machine | Low | Provide both Docker and native run options (optional) |
+| Misleading documentation in source repos | Medium | `verified` vs `hint` separation, code-first priority, provenance + code references |
+
+---
+
+## Status
+
+**Proposed.** Next step: create the `knowledge-mcp` repository and implement the baseline (FTS + MCP tools), then extend to hybrid retrieval with local embeddings.
