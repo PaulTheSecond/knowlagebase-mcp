@@ -248,7 +248,7 @@ class KnowledgeDB:
         cursor.execute("DELETE FROM symbols WHERE file_id = ?", (file_id,))
         self._auto_commit()
 
-    def add_symbol(self, file_id: int, name: str, qualified_name: str, kind: str, 
+    def add_symbol(self, file_id: int, name: str, qualified_name: str, kind: str,
                    language: str, line_start: int, line_end: int, signature: str, chunk_id: str) -> int:
         cursor = self.conn.cursor()
         cursor.execute("""
@@ -258,12 +258,39 @@ class KnowledgeDB:
         self._auto_commit()
         return cursor.lastrowid
 
+    def add_symbols_batch(self, records: list[tuple]) -> list[int]:
+        """Батчевая вставка символов. records: [(file_id, name, qname, kind, lang, ls, le, sig, chunk_id), ...]
+        Возвращает список rowid вставленных символов."""
+        if not records:
+            return []
+        cursor = self.conn.cursor()
+        rowids = []
+        for record in records:
+            cursor.execute("""
+                INSERT INTO symbols (file_id, name, qualified_name, kind, language, line_start, line_end, signature, chunk_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, record)
+            rowids.append(cursor.lastrowid)
+        self._auto_commit()
+        return rowids
+
     def add_symbol_edge(self, source_id: int, target_id: int, kind: str):
         cursor = self.conn.cursor()
         cursor.execute("""
             INSERT INTO symbol_edges (source_id, target_id, kind)
             VALUES (?, ?, ?)
         """, (source_id, target_id, kind))
+        self._auto_commit()
+
+    def add_symbol_edges_batch(self, records: list[tuple]):
+        """Батчевая вставка рёбер. records: [(source_id, target_id, kind), ...]"""
+        if not records:
+            return
+        cursor = self.conn.cursor()
+        cursor.executemany("""
+            INSERT INTO symbol_edges (source_id, target_id, kind)
+            VALUES (?, ?, ?)
+        """, records)
         self._auto_commit()
 
     def add_unresolved_ref(self, source_id: int, target_qualified_name: str, kind: str):
@@ -273,6 +300,33 @@ class KnowledgeDB:
             VALUES (?, ?, ?)
         """, (source_id, target_qualified_name, kind))
         self._auto_commit()
+
+    def add_unresolved_refs_batch(self, records: list[tuple]):
+        """Батчевая вставка unresolved ссылок. records: [(source_id, target_qname, kind), ...]"""
+        if not records:
+            return
+        cursor = self.conn.cursor()
+        cursor.executemany("""
+            INSERT INTO unresolved_refs (source_id, target_qualified_name, kind)
+            VALUES (?, ?, ?)
+        """, records)
+        self._auto_commit()
+
+    def add_chunks_batch(self, records: list[tuple]) -> list[int]:
+        """Батчевая вставка чанков. records: [(chunk_id, file_id, content, line_start, line_end, source_kind, trust, sha), ...]
+        Возвращает список rowid вставленных чанков."""
+        if not records:
+            return []
+        cursor = self.conn.cursor()
+        rowids = []
+        for record in records:
+            cursor.execute("""
+                INSERT INTO chunks (id, file_id, content, line_start, line_end, source_kind, trust, sha)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, record)
+            rowids.append(cursor.lastrowid)
+        self._auto_commit()
+        return rowids
 
     def resolve_pending_references(self) -> int:
         """Пытается найти таргеты для ссылок из unresolved_refs."""
