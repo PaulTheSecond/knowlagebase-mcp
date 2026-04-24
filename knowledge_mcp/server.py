@@ -102,7 +102,7 @@ _TOOL_SCHEMAS = [
             "type": "object",
             "properties": {
                 "repo_id": {"type": "string", "description": "The unique ID of the repository."},
-                "repo_path": {"type": "string", "description": "The absolute local path to the repository root directory."}
+                "repo_path": {"type": "string", "description": "The absolute path to the repository root directory INSIDE the Docker container (e.g. '/repos/ImpactOS.Core.Lib'). Do not use Windows paths here."}
             },
             "required": ["repo_id", "repo_path"]
         }
@@ -282,27 +282,25 @@ async def _handle_sync_repo(arguments: dict) -> list[types.TextContent]:
         return _err("Error: 'repo_id' and 'repo_path' arguments are required.")
 
     try:
-        from .indexer import Indexer
-        import sys
+        import urllib.request
+        import urllib.error
+        import json
 
-        def _run_sync():
-            # КРИТИЧЕСКИ ВАЖНО: перенаправляем stdout -> stderr,
-            # чтобы torch и progress bars не сломали MCP JSON-RPC
-            original_stdout = sys.stdout
-            sys.stdout = sys.stderr
-            try:
-                indexer = Indexer(db, use_embeddings=use_embeddings)
-                indexer.sync_repo(repo_id, repo_path, allowed_top_level=None)
-            finally:
-                sys.stdout = original_stdout
+        data = json.dumps({"repo_id": repo_id, "repo_path": repo_path}).encode("utf-8")
+        req = urllib.request.Request("http://127.0.0.1:8000/sync", data=data, headers={"Content-Type": "application/json"})
+        
+        # Делаем неблокирующий для MCP запрос к локальному Uvicorn-серверу (он крутится в том же контейнере)
+        def _trigger():
+            with urllib.request.urlopen(req) as response:
+                return response.read()
 
-        logger.info(f"Triggering background sync for '{repo_id}' at '{repo_path}'")
-        # Ждём завершения синхронизации, чтобы агент имел актуальные данные сразу после ответа
-        await asyncio.to_thread(_run_sync)
-        return [types.TextContent(type="text", text=f"Successfully synchronized repository '{repo_id}'. The knowledge base is now up to date.")]
+        logger.info(f"Triggering background sync for '{repo_id}' at '{repo_path}' via HTTP API")
+        await asyncio.to_thread(_trigger)
+        
+        return [types.TextContent(type="text", text=f"Successfully triggered background sync for repository '{repo_id}'. Check docker logs for progress. The knowledge base will be updated shortly.")]
     except Exception as e:
-        logger.error(f"Sync failed: {e}")
-        return _err(f"Failed to synchronize repository: {e}")
+        logger.error(f"Sync trigger failed: {e}")
+        return _err(f"Failed to trigger repository sync: {e}")
 
 
 async def _handle_find_symbol(arguments: dict) -> list[types.TextContent]:
